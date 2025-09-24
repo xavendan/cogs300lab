@@ -1,2 +1,141 @@
 Lab code here: 
-hi
+// ---------------- Pin Setup ----------------
+
+
+// Left motor (Motor A)
+#define enA 9
+#define in1 8
+#define in2 7
+
+
+// Right motor (Motor B)
+#define enB 11
+#define in3 12
+#define in4 13
+
+
+int speedValue = 200; // default speed
+String command = "";
+
+
+void setup() {
+  pinMode(enA, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+
+
+  pinMode(enB, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+
+  Serial.begin(9600);
+  stopCar();
+  Serial.println("Car ready!");
+  Serial.println("Commands: f, b, tl, tr, sl, sr, s, spd <0-255>");
+}
+
+
+void loop() {
+  if (Serial.available() > 0) {
+    command = Serial.readStringUntil('\n');
+    command.trim();
+
+
+    if (command == "f") {
+      forward(); Serial.println("Forward");
+    } else if (command == "b") {
+      backward(); Serial.println("Backward");
+    } else if (command == "tl") {
+      turnLeft(); Serial.println("Turn Left");
+    } else if (command == "tr") {
+      turnRight(); Serial.println("Turn Right");
+    } else if (command == "sl") {
+      spinLeft(); Serial.println("Spin Left");
+    } else if (command == "sr") {
+      spinRight(); Serial.println("Spin Right");
+    } else if (command == "s") {
+      stopCar(); Serial.println("Stop");
+    } else if (command.startsWith("spd")) {
+      int newSpeed = command.substring(4).toInt();
+      if (newSpeed >= 0 && newSpeed <= 255) {
+        speedValue = newSpeed;
+        Serial.print("Speed set to: ");
+        Serial.println(speedValue);
+      } else {
+        Serial.println("Invalid speed! Use 0–255.");
+      }
+    } else {
+      Serial.println("Unknown command!");
+    }
+  }
+}
+
+
+// ---------------- Motor Functions ----------------
+
+
+// Forward = both motors forward
+void forward() {
+  digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // Left motor forward
+  digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // Right motor forward
+  analogWrite(enA,speedValue);
+  analogWrite(enB,speedValue);
+}
+
+
+// Backward = both motors backward
+void backward() {
+  digitalWrite(in1,HIGH); digitalWrite(in2,LOW);  // Left motor backward
+  digitalWrite(in3,LOW); digitalWrite(in4,HIGH);  // Right motor backward
+  analogWrite(enA,speedValue);
+  analogWrite(enB,speedValue);
+}
+
+
+// Turn left = left motor slower, right motor normal
+void turnLeft() {
+  digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // left forward
+  digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // right forward
+  analogWrite(enA,speedValue);
+  analogWrite(enB,speedValue/2);
+}
+
+
+// Turn right = left motor normal, right motor slower
+void turnRight() {
+  digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // left forward
+  digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // right forward
+  analogWrite(enA,speedValue/2);
+  analogWrite(enB,speedValue);
+}
+
+
+// Spin left = left backward, right forward
+void spinLeft() {
+  digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // left backward
+  digitalWrite(in3,LOW); digitalWrite(in4,HIGH);  // right forward
+  analogWrite(enA,speedValue);
+  analogWrite(enB,speedValue);
+}
+
+
+// Spin right = left forward, right backward
+void spinRight() {
+  digitalWrite(in1,HIGH); digitalWrite(in2,LOW);  // left forward
+  digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // right backward
+  analogWrite(enA,speedValue);
+  analogWrite(enB,speedValue);
+}
+
+
+// Stop motors
+void stopCar() {
+  digitalWrite(in1,LOW); digitalWrite(in2,LOW);
+  digitalWrite(in3,LOW); digitalWrite(in4,LOW);
+  analogWrite(enA,0);
+  analogWrite(enB,0);
+}
+
+
+
