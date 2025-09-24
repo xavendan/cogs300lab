@@ -1,0 +1,111 @@
+// Replayer
+// Loads robot_log.csv and replays commands with original timing
+// Keys: SPACE play or pause   R restart   ESC quit
+
+import processing.serial.*;
+
+Serial myPort;
+Table logTable;
+
+int startTime = 0;
+int nextIndex = 0;
+boolean isPlaying = false;
+boolean finished = false;
+
+void setup() {
+  size(600, 160);
+
+  printArray(Serial.list());
+  // Adjust index if needed
+  myPort = new Serial(this, Serial.list()[2], 9600);
+
+  // Load the CSV from the sketch folder
+  String csvPath = sketchPath("robot_log.csv");
+  println("Loading: " + csvPath);
+
+  logTable = loadTable(csvPath, "header,csv");
+  if (logTable == null || logTable.getRowCount() == 0) {
+    println("No rows found in robot_log.csv");
+  } else {
+    println("Loaded " + logTable.getRowCount() + " rows");
+    logTable.sort("time_ms");
+  }
+
+  textFont(createFont("Arial", 16));
+  resetPlayback();
+}
+
+void draw() {
+  background(245);
+  fill(0);
+
+  text("Replayer", 20, 35);
+  text("SPACE play or pause   R restart   ESC quit", 20, 60);
+  text("CSV: " + sketchPath("robot_log.csv"), 20, 85);
+
+  String status = "Status: " + (finished ? "finished" : (isPlaying ? "playing" : "paused"));
+  text(status, 20, 110);
+
+  String progress = "Next index: " + nextIndex + " of " + (logTable == null ? 0 : logTable.getRowCount());
+  text(progress, 20, 135);
+
+  if (!isPlaying || finished || logTable == null) return;
+
+  int elapsed = millis() - startTime;
+
+  // Send all commands whose time_ms <= elapsed
+  while (nextIndex < logTable.getRowCount()) {
+    TableRow row = logTable.getRow(nextIndex);
+    int t = row.getInt("time_ms");
+    if (t <= elapsed) {
+      String cmd = row.getString("command");
+      String arg = row.getString("arg");
+      String toSend = cmd;
+      if (cmd.equals("spd") && arg != null && arg.length() > 0) {
+        toSend = "spd " + arg;
+      }
+      myPort.write(toSend + "\n");
+      println("Replay sent: " + toSend + " at " + t + " ms");
+      nextIndex++;
+    } else {
+      break;
+    }
+  }
+
+  if (nextIndex >= logTable.getRowCount()) {
+    finished = true;
+    isPlaying = false;
+    println("Replay finished");
+  }
+}
+
+void keyPressed() {
+  if (key == ' ') {
+    if (finished) {
+      resetPlayback();
+    }
+    isPlaying = !isPlaying;
+    if (isPlaying) {
+      startTime = millis() - currentElapsed();
+    }
+  } else if (key == 'r' || key == 'R') {
+    resetPlayback();
+  } else if (key == ESC) {
+    key = 0;
+    exit();
+  }
+}
+
+void resetPlayback() {
+  isPlaying = false;
+  finished = false;
+  nextIndex = 0;
+  startTime = millis();
+  println("Playback reset");
+}
+
+int currentElapsed() {
+  if (nextIndex < 1) return 0;
+  int lastSentIdx = nextIndex - 1;
+  return logTable.getRow(lastSentIdx).getInt("time_ms");
+}
