@@ -1,0 +1,34 @@
+import processing.serial.*;
+
+Serial myPort;
+String inputText = "";  // stores what you type
+
+void setup() {
+  size(400, 100);
+  printArray(Serial.list()); // list all ports
+  myPort = new Serial(this, Serial.list()[2], 9600);
+
+  println("Type commands and press ENTER to send:");
+  println("Commands: f, b, tl, tr, sl, sr, s, spd <0-255>");
+}
+
+void draw() {
+  background(200);
+  fill(0);
+  textSize(16);
+  text("Command: " + inputText, 20, 50);
+}
+
+void keyPressed() {
+  if (key == '\n' || key == '\r') { // ENTER key
+    myPort.write(inputText + "\n"); // send typed command to Arduino
+    println("Sent: " + inputText);
+    inputText = ""; // clear input
+  } else if (key == BACKSPACE) {
+    if (inputText.length() > 0) {
+      inputText = inputText.substring(0, inputText.length() - 1);
+    }
+  } else {
+    inputText += key; // add typed character
+  }
+}
