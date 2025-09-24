@@ -1,5 +1,5 @@
 Lab code here: 
-// ---------------- Pin Setup ----------------
+// Pin Setup 
 
 
 // Left motor (Motor A)
@@ -72,7 +72,7 @@ void loop() {
 }
 
 
-// ---------------- Motor Functions ----------------
+// Motor Functions 
 
 
 // Forward = both motors forward
@@ -97,8 +97,8 @@ void backward() {
 void turnLeft() {
   digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // left forward
   digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // right forward
-  analogWrite(enA,speedValue);
-  analogWrite(enB,speedValue/2);
+  analogWrite(enA,speedValue/2);
+  analogWrite(enB,speedValue/3);
 }
 
 
@@ -106,8 +106,8 @@ void turnLeft() {
 void turnRight() {
   digitalWrite(in1,LOW); digitalWrite(in2,HIGH);  // left forward
   digitalWrite(in3,HIGH); digitalWrite(in4,LOW);  // right forward
-  analogWrite(enA,speedValue/2);
-  analogWrite(enB,speedValue);
+  analogWrite(enA,speedValue/3);
+  analogWrite(enB,speedValue/2);
 }
 
 
