@@ -1,0 +1,93 @@
+// Controller + Recorder
+// Sends typed commands to Arduino and logs them to robot_log.csv
+// CSV columns: time_ms,command,arg
+// time_ms is milliseconds since the first command
+
+import processing.serial.*;
+
+Serial myPort;
+String inputText = "";
+boolean firstCommandSent = false;
+int t0 = 0;
+
+// Logging
+Table logTable;
+
+void setup() {
+  size(500, 120);
+
+  // List ports so you can confirm the index
+  printArray(Serial.list());
+  // Adjust index if needed
+  myPort = new Serial(this, Serial.list()[2], 9600);
+
+  textFont(createFont("Arial", 16));
+  println("Type commands then press ENTER to send");
+  println("Commands: f, b, tl, tr, sl, sr, s, spd <0-255>");
+
+  // Prepare a table for logging
+  logTable = new Table();
+  logTable.addColumn("time_ms", Table.INT);
+  logTable.addColumn("command");
+  logTable.addColumn("arg");
+}
+
+void draw() {
+  background(230);
+  fill(0);
+  text("Command: " + inputText, 20, 55);
+
+  String status = "Logging to: " + sketchPath("robot_log.csv");
+  textSize(12);
+  fill(50);
+  text(status, 20, 90);
+}
+
+void keyPressed() {
+  if (key == '\n' || key == '\r') {
+    String line = inputText.trim();
+    if (line.length() == 0) return;
+
+    // Send to Arduino
+    myPort.write(line + "\n");
+    println("Sent: " + line);
+
+    // Start timer on first command
+    if (!firstCommandSent) {
+      firstCommandSent = true;
+      t0 = millis();
+    }
+
+    // Parse for logging
+    String cmd = line;
+    String arg = "";
+
+    // Support both "spd 200" and "spd:200"
+    if (line.startsWith("spd")) {
+      String[] parts = splitTokens(line, " :\t");
+      cmd = "spd";
+      if (parts.length >= 2) arg = parts[1];
+    }
+
+    // Add a row
+    TableRow row = logTable.addRow();
+    row.setInt("time_ms", millis() - t0);
+    row.setString("command", cmd);
+    row.setString("arg", arg);
+
+    // Save to CSV on every send
+    saveTable(logTable, sketchPath("robot_log.csv"));
+
+    // Clear input
+    inputText = "";
+  } else if (key == BACKSPACE) {
+    if (inputText.length() > 0) {
+      inputText = inputText.substring(0, inputText.length() - 1);
+    }
+  } else if (key == ESC) {
+    key = 0;
+    exit();
+  } else {
+    inputText += key;
+  }
+}
