@@ -1,0 +1,137 @@
+// Motor Pins
+#define enA 9
+#define in1 8
+#define in2 7
+#define enB 10
+#define in3 12
+#define in4 13
+
+// Encoder Pins
+#define D_1 2
+#define D_2 3
+
+int speedValue = 200; // default speed
+String command = "";
+
+// Encoder counts
+volatile long leftCount = 0;
+volatile long rightCount = 0;
+
+// Timing
+unsigned long lastUpdate = 0;
+const int interval = 50; // ms between speed corrections
+
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(enB, OUTPUT); pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+
+  pinMode(D_1, INPUT_PULLUP);
+  pinMode(D_2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(D_1), leftEncoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(D_2), rightEncoder, RISING);
+
+  Serial.begin(9600);
+  stopCar();
+  Serial.println("Car ready!");
+  Serial.println("Commands: f, b, tl, tr, sl, sr, s, spd <0-255>");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+
+    if (command == "f") forward();
+    else if (command == "b") backward();
+    else if (command == "tl") turnLeft();
+    else if (command == "tr") turnRight();
+    else if (command == "sl") spinLeft();
+    else if (command == "sr") spinRight();
+    else if (command == "s") stopCar();
+    else if (command.startsWith("spd")) {
+      int newSpeed = command.substring(4).toInt();
+      if (newSpeed >= 0 && newSpeed <= 255) speedValue = newSpeed;
+    }
+  }
+
+  // --- Encoder-based straight correction every interval ---
+  if (millis() - lastUpdate >= interval) {
+    lastUpdate = millis();
+    adjustSpeed();
+    leftCount = 0;
+    rightCount = 0;
+  }
+}
+
+// ---------------- Encoder interrupts ----------------
+void leftEncoder() { leftCount++; }
+void rightEncoder() { rightCount++; }
+
+// ---------------- Motor Functions ----------------
+void forward() {
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speedValue);
+  analogWrite(enB, speedValue);
+}
+
+void backward() {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
+  analogWrite(enA, speedValue);
+  analogWrite(enB, speedValue);
+}
+
+void turnLeft() {
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speedValue / 2);
+  analogWrite(enB, speedValue);
+}
+
+void turnRight() {
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speedValue);
+  analogWrite(enB, speedValue / 2);
+}
+
+void spinLeft() {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, speedValue);
+  analogWrite(enB, speedValue);
+}
+
+void spinRight() {
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
+  analogWrite(enA, speedValue);
+  analogWrite(enB, speedValue);
+}
+
+void stopCar() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  analogWrite(enA, 0);
+  analogWrite(enB, 0);
+}
+
+// ---------------- Speed Correction ----------------
+void adjustSpeed() {
+  // Simple proportional adjustment
+  int error = leftCount - rightCount;
+  int correction = error * 2; // adjust this factor as needed
+
+  int leftSpeed = speedValue - correction;
+  int rightSpeed = speedValue + correction;
+
+  // constrain values to 0-255
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+
+  analogWrite(enA, leftSpeed);
+  analogWrite(enB, rightSpeed);
+}
