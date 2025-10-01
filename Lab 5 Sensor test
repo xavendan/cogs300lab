@@ -1,0 +1,30 @@
+// HC-SR04 front-only quick test
+const byte TRIG_F = 12;  // <-- put your actual TRIG pin here
+const byte ECHO_F = 13;  // <-- put your actual ECHO pin here
+const byte TRIG_R = 2;   // rear TRIG (held LOW to avoid cross-talk)
+
+void setup() {
+  pinMode(TRIG_F, OUTPUT);
+  pinMode(ECHO_F, INPUT);
+  pinMode(TRIG_R, OUTPUT);
+  digitalWrite(TRIG_R, LOW);   // disable rear sensor
+  Serial.begin(115200);
+}
+
+void loop() {
+  // trigger 10us pulse
+  digitalWrite(TRIG_F, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_F, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_F, LOW);
+
+  // raw echo time with a timeout (30,000 µs ~ 5 m max)
+  unsigned long dur = pulseIn(ECHO_F, HIGH, 30000);
+
+  // convert to cm (dur/58); print both for debugging
+  float cm = (dur == 0) ? -1 : dur / 58.0;
+
+  Serial.print("dur(us)="); Serial.print(dur);
+  Serial.print("  dist(cm)="); Serial.println(cm, 1);
+
+  delay(200);
+}
