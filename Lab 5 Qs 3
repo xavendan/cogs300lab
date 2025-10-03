@@ -1,0 +1,149 @@
+// ---------------- HC-SR04 ----------------
+#define TRIG_PIN 3
+#define ECHO_PIN 2
+
+// ---------------- Motors (L298N) ----------------
+// Left motor
+#define ENA 9
+#define IN1 8
+#define IN2 7
+// Right motor
+#define ENB 11
+#define IN3 12
+#define IN4 13
+
+// ---------------- Follow-Me & Manual ----------------
+const float SET_DISTANCE = 25.0;  // cm target
+float Kp = 2.0;                    // P gain
+int MAX_SPEED = 120;               // max motor power for follow-me
+int MIN_SPEED = 40;                // dead zone for follow-me
+
+String command = "";
+
+void setup() {
+  Serial.begin(9600);
+
+  // Motor pins
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  stopCar();
+
+  Serial.println("Car ready!");
+  Serial.println("Manual commands: f, b, tl, tr, sl, sr, s, spd <0-255>");
+}
+
+void loop() {
+  // 1️⃣ Check Serial for manual commands
+  if (Serial.available() > 0) {
+    command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command == "f") { forward(MAX_SPEED); Serial.println("Forward"); return; }
+    else if (command == "b") { backward(MAX_SPEED); Serial.println("Backward"); return; }
+    else if (command == "tl") { turnLeft(MAX_SPEED); Serial.println("Turn Left"); return; }
+    else if (command == "tr") { turnRight(MAX_SPEED); Serial.println("Turn Right"); return; }
+    else if (command == "sl") { spinLeft(MAX_SPEED); Serial.println("Spin Left"); return; }
+    else if (command == "sr") { spinRight(MAX_SPEED); Serial.println("Spin Right"); return; }
+    else if (command == "s") { stopCar(); Serial.println("Stop"); return; }
+    else if (command.startsWith("spd")) {
+      int val = command.substring(4).toInt();
+      if(val >= 0 && val <= 255) { MAX_SPEED = val; Serial.print("Max speed set to "); Serial.println(MAX_SPEED); }
+      else Serial.println("Invalid speed! Use 0-255");
+      return;
+    } else {
+      Serial.println("Unknown command");
+      return;
+    }
+  }
+
+  // 2️⃣ If no manual command, follow target automatically
+  long duration = getDistance();
+  float distance_cm = duration / 58.0;  // convert microseconds to cm
+  Serial.print("Distance: "); Serial.print(distance_cm); Serial.println(" cm");
+
+  float error = distance_cm - SET_DISTANCE;
+  int outputSpeed = (int)(Kp * error);
+
+  // Clamp speed
+  if(outputSpeed > MAX_SPEED) outputSpeed = MAX_SPEED;
+  if(outputSpeed < -MAX_SPEED) outputSpeed = -MAX_SPEED;
+
+  // Dead zone stop
+  if(abs(error) < 5) {
+    stopCar();
+  } else if(outputSpeed > 0) {
+    forward(outputSpeed);
+  } else {
+    backward(-outputSpeed);
+  }
+
+  delay(50);
+}
+
+// ---------------- Motor Functions ----------------
+void forward(int speed) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);  // left forward
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  // right forward
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void backward(int speed) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  // left backward
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);  // right backward
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void turnLeft(int speed) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed/2);
+  analogWrite(ENB, speed);
+}
+
+void turnRight(int speed) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed/2);
+}
+
+void spinLeft(int speed) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void spinRight(int speed) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void stopCar() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+// ---------------- Ultrasonic Function ----------------
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  if(duration == 0) duration = 1; // prevent zero
+  return duration;
+}
