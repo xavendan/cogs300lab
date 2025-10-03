@@ -1,0 +1,87 @@
+// Pins from your wiring
+#define enA 9
+#define in1 8
+#define in2 7
+
+#define enB 11
+#define in3 13
+#define in4 12
+
+// Keep these as they were (spins are correct)
+bool INVERT_LEFT  = false;
+bool INVERT_RIGHT = true;
+
+char cmd;
+int motorSpeed = 60;  // your chosen speed
+
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(enB, OUTPUT); pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  Serial.begin(9600);
+  analogWrite(enA, motorSpeed);
+  analogWrite(enB, motorSpeed);
+  stopMotors();
+  Serial.println("f=forward, b=backward, l=spin left, r=spin right, s=stop");
+}
+
+void loop() {
+  if (Serial.available()) {
+    cmd = tolower(Serial.read());
+    if      (cmd == 'f') { forward();  Serial.println("Forward");  }
+    else if (cmd == 'b') { backward(); Serial.println("Backward"); }
+    else if (cmd == 'l') { spinLeft(); Serial.println("Spin Left");}
+    else if (cmd == 'r') { spinRight();Serial.println("Spin Right");}
+    else if (cmd == 's') { stopMotors();Serial.println("Stop");    }
+  }
+}
+
+// --- Helpers ---
+void setLeft(bool forward) {
+  if (INVERT_LEFT) forward = !forward;
+  if (forward) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  }
+  else         { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }
+}
+
+void setRight(bool forward) {
+  if (INVERT_RIGHT) forward = !forward;
+  if (forward) { digitalWrite(in3, HIGH); digitalWrite(in4, LOW);  }
+  else         { digitalWrite(in3, LOW);  digitalWrite(in4, HIGH); }
+}
+
+// --- Movements ---
+// Flip ONLY forward/back so they match your expectation.
+// (Spins untouched, since they already work.)
+void forward()  {
+  analogWrite(enA, motorSpeed);
+  analogWrite(enB, motorSpeed);
+  // previously: setLeft(true); setRight(true);
+  setLeft(false);
+  setRight(false);
+}
+
+void backward() {
+  analogWrite(enA, motorSpeed);
+  analogWrite(enB, motorSpeed);
+  // previously: setLeft(false); setRight(false);
+  setLeft(true);
+  setRight(true);
+}
+
+void spinLeft() {
+  analogWrite(enA, motorSpeed);
+  analogWrite(enB, motorSpeed);
+  setLeft(false);
+  setRight(true);
+}
+
+void spinRight() {
+  analogWrite(enA, motorSpeed);
+  analogWrite(enB, motorSpeed);
+  setLeft(true);
+  setRight(false);
+}
+
+void stopMotors() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+}
