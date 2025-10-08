@@ -1,0 +1,214 @@
+/*
+ * Robot Remote Control for Processing
+ *
+ * This sketch provides a clean, visual keyboard interface to control the
+ * state-based Arduino robot car. It's designed for clarity and ease of
+ * understanding, making it suitable for students and hobbyists.
+ *
+ * HOW IT WORKS:
+ * 1. It tracks which of the WASD keys are currently held down using boolean flags.
+ * 2. In each frame, it builds a command string containing all currently pressed
+ *    keys (e.g., "w", "d", "wd", "sa").
+ * 3. It periodically sends this command string to the Arduino over the serial port.
+ *    This continuous sending prevents the Arduino's safety timeout from stopping
+ *    the robot during continuous movement.
+ *
+ * CONTROLS:
+ * - Hold 'W'/'S' for forward/backward movement.
+ * - Hold 'A'/'D' for left/right pivoting.
+ * - Combine keys (e.g., hold 'W' and 'D' simultaneously) to make the
+ *   robot turn while moving.
+ */
+
+import processing.serial.*;
+
+// --- Configuration & Constants ---
+final int BAUD_RATE = 115200;      // Must match the Arduino's Serial.begin() rate.
+final int SEND_INTERVAL_MS = 100;  // Send a command every 100ms to keep the Arduino from timing out.
+final color INACTIVE_KEY_COLOR = color(180);
+final color ACTIVE_KEY_COLOR = color(0, 200, 0);
+final color TEXT_COLOR = color(50);
+final color KEY_TEXT_COLOR = color(255);
+
+// --- Global Variables ---
+Serial myPort;      // The serial port object for communicating with the Arduino.
+PFont myFont;       // The font used for drawing text.
+
+// Boolean flags to track the current state of each control key.
+boolean keyForward, keyBackward, keyLeft, keyRight;
+
+// State management for sending commands.
+String lastCommandSent = "";      // Stores the last command sent to avoid redundant sends.
+long lastSendTime = 0;            // Timestamp of the last command sent.
+
+
+//================================================================
+//                      SETUP AND DRAW
+//================================================================
+
+/**
+ * setup() runs once at the beginning of the program.
+ * It initializes the window, loads the font, and attempts to
+ * establish a serial connection with the Arduino.
+ */
+void setup() {
+  size(400, 400);
+  myFont = createFont("Arial", 24);
+  textFont(myFont);
+
+  // --- Initialize Serial Communication ---
+  println("Available serial ports:");
+  printArray(Serial.list());
+
+  try {
+    // !!! IMPORTANT: CHANGE THIS INDEX TO MATCH YOUR ARDUINO'S PORT !!!
+    // On Windows, this might be a higher number like [4] or [5].
+    // On Mac/Linux, it might be [0] or [1]. Check the list printed above.
+    String portName = Serial.list()[4];
+    myPort = new Serial(this, portName, BAUD_RATE);
+    println("Successfully connected to port: " + portName);
+  }
+  catch (Exception e) {
+    println("Error: Could not connect to serial port.");
+    println("Please check the port index number in the setup() function.");
+    e.printStackTrace();
+  }
+}
+
+/**
+ * draw() is the main loop, running continuously.
+ * It clears the screen, draws the user interface, and handles the
+ * logic for sending commands to the robot.
+ */
+void draw() {
+  background(240);
+  drawControlInterface();
+  handleRobotControl();
+}
+
+
+//================================================================
+//                    CORE LOGIC AND UI
+//================================================================
+
+/**
+ * Builds the command string based on currently pressed keys and sends it
+ * over the serial port. It sends either when the keys change or when the
+ * timer interval has passed.
+ */
+void handleRobotControl() {
+  // Do nothing if the serial port isn't available.
+  if (myPort == null) {
+    return;
+  }
+
+  // 1. Build the command string from the current key states.
+  //    This allows for combined commands like "wd" or "sa".
+  String currentCommand = "";
+  if (keyForward)  currentCommand += "w";
+  if (keyBackward) currentCommand += "s";
+  if (keyLeft)     currentCommand += "a";
+  if (keyRight)    currentCommand += "d";
+
+  // 2. Decide whether to send the command.
+  // We send if the command has changed (e.g., user pressed or released a key).
+  boolean commandHasChanged = !currentCommand.equals(lastCommandSent);
+  // We ALSO send periodically if keys are being held down, to prevent the
+  // Arduino's safety timeout from kicking in.
+  boolean isHoldingKeys = !currentCommand.isEmpty();
+  boolean intervalHasPassed = (millis() - lastSendTime > SEND_INTERVAL_MS);
+
+  if (commandHasChanged || (isHoldingKeys && intervalHasPassed)) {
+    // If the command is empty, it means we just released the keys.
+    // Instead of sending nothing, we send a single space character.
+    // The Arduino's switch statement will not recognize ' ', so it will
+    // hit the `else` block and call `stopMotors()`, which is exactly what we want.
+    String commandToSend = currentCommand.isEmpty() ? " " : currentCommand;
+
+    myPort.write(commandToSend);      // Send the command string to the Arduino.
+    lastCommandSent = currentCommand; // Update the state with the logical command.
+    lastSendTime = millis();          // Reset the timer.
+  }
+}
+
+/**
+ * Draws the visual interface, including the title, instructions,
+ * the keyboard layout, and the connection status.
+ */
+void drawControlInterface() {
+  // --- Draw Titles and Instructions ---
+  fill(TEXT_COLOR);
+  textAlign(CENTER, TOP);
+  textSize(24);
+  text("Robot Remote Control", width / 2, 20);
+
+  textAlign(CENTER, CENTER);
+  textSize(18);
+  text("Hold WASD to Move", width / 2, 60);
+
+  // --- Draw WASD Key Indicators ---
+  noStroke();
+  // We use a compact "ternary operator" here to choose the color.
+  // It reads: (is_this_true ? use_this_value : otherwise_use_this_one)
+  fill(keyForward ? ACTIVE_KEY_COLOR : INACTIVE_KEY_COLOR);
+  rect(width/2 - 25, height/2 - 60, 50, 50, 5); // W
+
+  fill(keyBackward ? ACTIVE_KEY_COLOR : INACTIVE_KEY_COLOR);
+  rect(width/2 - 25, height/2 + 10, 50, 50, 5); // S
+
+  fill(keyLeft ? ACTIVE_KEY_COLOR : INACTIVE_KEY_COLOR);
+  rect(width/2 - 85, height/2 + 10, 50, 50, 5); // A
+
+  fill(keyRight ? ACTIVE_KEY_COLOR : INACTIVE_KEY_COLOR);
+  rect(width/2 + 35, height/2 + 10, 50, 50, 5); // D
+
+  // --- Draw Text Labels on Keys ---
+  fill(KEY_TEXT_COLOR);
+  textSize(32);
+  text("W", width/2, height/2 - 35);
+  text("S", width/2, height/2 + 35);
+  text("A", width/2 - 60, height/2 + 35);
+  text("D", width/2 + 60, height/2 + 35);
+
+  // --- Draw Connection Status ---
+  textSize(16);
+  if (myPort != null) {
+    fill(0, 150, 0);
+    text("Status: Connected", width/2, height - 40);
+  } else {
+    fill(200, 0, 0);
+    text("Status: DISCONNECTED", width/2, height - 40);
+    text("Check console and edit port index in setup()", width/2, height - 20);
+  }
+}
+
+
+//================================================================
+//                      EVENT HANDLERS
+//================================================================
+
+/**
+ * This function is automatically called by Processing whenever a key is pressed.
+ * It sets the corresponding boolean flag to true.
+ */
+void keyPressed() {
+  switch(key) {
+    case 'w': case 'W': keyForward = true; break;
+    case 's': case 'S': keyBackward = true; break;
+    case 'a': case 'A': keyLeft = true; break;
+    case 'd': case 'D': keyRight = true; break;
+  }
+}
+
+/**
+ * This function is automatically called by Processing whenever a key is released.
+ * It sets the corresponding boolean flag to false.
+ */
+void keyReleased() {
+  switch(key) {
+    case 'w': case 'W': keyForward = false; break;
+    case 's': case 'S': keyBackward = false; break;
+    case 'a': case 'A': keyLeft = false; break;
+    case 'd': case 'D': keyRight = false; break;
+  }
+}
