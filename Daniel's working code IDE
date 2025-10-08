@@ -1,0 +1,189 @@
+/*
+ * Arduino sketch for a 2-wheel robot controlled via Serial commands.
+ * This refactored version uses a state-based approach for more intuitive
+ * control, allowing for combined commands like "wd" to turn while moving forward.
+ *
+ * Motor A is assumed to be the LEFT motor.
+ * Motor B is assumed to be the RIGHT motor.
+ *
+ * Serial Commands (can be combined, e.g., "wd", "sa"):
+ *   'w' - Move forward
+ *   's' - Move backward
+ *   'a' - Turn left
+ *   'd' - Turn right
+ *
+ *   Any other character or a pause in commands will stop the motors.
+ */
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable  9 // ENA
+#define leftMotorIn1     8 // IN1
+#define leftMotorIn2     7 // IN2
+
+#define rightMotorIn1    13  // IN3
+#define rightMotorIn2    12  // IN4
+#define rightMotorEnable 11  // ENB
+
+// --- Control & Configuration ---
+const int motorSpeed = 200;       // Base speed for motors (0-255)
+const float turnFactor = 0.5;     // Determines how much slower the inside wheel turns (0.5 = 50% speed)
+const int commandTimeout = 250;   // Stop motors if no command is received for this many milliseconds
+
+unsigned long lastCommandTime = 0;
+bool isStopped = true;
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Robot is ready. Send commands (w,a,s,d) via Serial Monitor.");
+    Serial.println("Combine keys for turning, e.g., type 'wd' and press Send.");
+
+    // Set all motor control pins to outputs
+    pinMode(rightMotorEnable, OUTPUT);
+    pinMode(rightMotorIn1, OUTPUT);
+    pinMode(rightMotorIn2, OUTPUT);
+    pinMode(leftMotorEnable, OUTPUT);
+    pinMode(leftMotorIn1, OUTPUT);
+    pinMode(leftMotorIn2, OUTPUT);
+
+    // Ensure motors are stopped at startup
+    stopMotors();
+}
+
+void loop() {
+    // Check if there is a command waiting in the serial buffer
+    if (Serial.available() > 0) {
+        // --- State flags for the current command batch ---
+        bool isMovingForward = false;
+        bool isMovingBackward = false;
+        bool isTurningLeft = false;
+        bool isTurningRight = false;
+
+        lastCommandTime = millis(); // A command was received, so reset the timer
+        isStopped = false;
+
+        // Read all available characters to capture combined presses (e.g., "wd")
+        while (Serial.available() > 0) {
+            char command = Serial.read();
+            switch (command) {
+                case 'w': isMovingForward = true; break;
+                case 's': isMovingBackward = true; break;
+                case 'a': isTurningLeft = true;   break;
+                case 'd': isTurningRight = true;  break;
+            }
+        }
+
+        // --- Make a decision based on the combined state ---
+        // The order here matters: we check for turns first.
+        if (isMovingForward && isTurningLeft) {
+            turnForwardLeft(motorSpeed);
+        } else if (isMovingForward && isTurningRight) {
+            turnForwardRight(motorSpeed);
+        } else if (isMovingBackward && isTurningLeft) {
+            turnBackwardLeft(motorSpeed);
+        } else if (isMovingBackward && isTurningRight) {
+            turnBackwardRight(motorSpeed);
+        } else if (isMovingForward) {
+            moveForward(motorSpeed);
+        } else if (isMovingBackward) {
+            moveBackward(motorSpeed);
+        } else if (isTurningLeft) {
+            pivotLeft(motorSpeed);
+        } else if (isTurningRight) {
+            pivotRight(motorSpeed);
+        } else {
+            // If the received command was not one of the valid keys, stop.
+            stopMotors();
+            isStopped = true;
+        }
+    }
+
+    // Safety feature: Stop motors if no command is received after the timeout
+    if (millis() - lastCommandTime > commandTimeout && !isStopped) {
+        stopMotors();
+        isStopped = true;
+        Serial.println("Command timeout. Motors stopped.");
+    }
+}
+
+
+//================================================================
+//                    MOTOR CONTROL FUNCTIONS
+//================================================================
+
+/**
+ * A low-level function to control both motors at once.
+ * This is the heart of the motor control system. It simplifies all
+ * other movement functions into single-line calls.
+ * @param leftSpeed - Speed for the left motor (-255 to 255). Negative is backward.
+ * @param rightSpeed - Speed for the right motor (-255 to 255). Negative is backward.
+ */
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+    // --- Control Left Motor ---
+    // Set direction based on the sign of the speed
+    if (leftSpeed > 0) {
+        digitalWrite(leftMotorIn1, HIGH);
+        digitalWrite(leftMotorIn2, LOW);
+    } else {
+        digitalWrite(leftMotorIn1, LOW);
+        digitalWrite(leftMotorIn2, HIGH);
+    }
+    // Set speed (PWM) using the absolute value
+    analogWrite(leftMotorEnable, abs(leftSpeed));
+
+    // --- Control Right Motor ---
+    // Set direction based on the sign of the speed
+    if (rightSpeed > 0) {
+        digitalWrite(rightMotorIn1, LOW);
+        digitalWrite(rightMotorIn2, HIGH);
+    } else {
+        digitalWrite(rightMotorIn1, HIGH);
+        digitalWrite(rightMotorIn2, LOW);
+    }
+    // Set speed (PWM) using the absolute value
+    analogWrite(rightMotorEnable, abs(rightSpeed));
+}
+
+
+// --- High-Level Movement Functions ---
+// These functions provide a clear, readable API for controlling the robot's
+// movement. Each one simply calls setMotorSpeeds with the correct parameters.
+
+void stopMotors() {
+    setMotorSpeeds(0, 0);
+}
+
+void moveForward(int speed) {
+    setMotorSpeeds(speed, speed);
+}
+
+void moveBackward(int speed) {
+    setMotorSpeeds(-speed, -speed);
+}
+
+void pivotLeft(int speed) {
+    setMotorSpeeds(-speed, speed); // Left motor backward, right motor forward
+}
+
+void pivotRight(int speed) {
+    setMotorSpeeds(speed, -speed); // Left motor forward, right motor backward
+}
+
+void turnForwardLeft(int speed) {
+    // Both wheels forward, left wheel slower
+    setMotorSpeeds(speed * turnFactor, speed);
+}
+
+void turnForwardRight(int speed) {
+    // Both wheels forward, right wheel slower
+    setMotorSpeeds(speed, speed * turnFactor);
+}
+
+void turnBackwardLeft(int speed) {
+    // Both wheels backward, left wheel slower
+    setMotorSpeeds(-speed * turnFactor, -speed);
+}
+
+void turnBackwardRight(int speed) {
+    // Both wheels backward, right wheel slower
+    setMotorSpeeds(-speed, -speed * turnFactor);
+}
