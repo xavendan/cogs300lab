@@ -1,0 +1,275 @@
+/*
+ * Arduino sketch for a 2-wheel robot controlled via Serial commands.
+ * Extended to add an autonomous front-distance hold:
+ *   Move forward while front distance > 25 cm
+ *   Stop when distance <= 25 cm
+ *
+ * Your original motor API and pin mappings are unchanged.
+ */
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable  9  // ENA
+#define leftMotorIn1     8  // IN1
+#define leftMotorIn2     7  // IN2
+
+#define rightMotorIn1    13 // IN3
+#define rightMotorIn2    12 // IN4
+#define rightMotorEnable 11 // ENB
+
+// --- Ultrasonic Front Sensor ---
+#define ULTRASONIC_TRIG  3  // If readings fail, try swapping to 2
+#define ULTRASONIC_ECHO  2  // If readings fail, try swapping to 3
+
+// --- Control & Configuration ---
+const int motorSpeed = 110;        // Base speed for motors (0-255)
+const float turnFactor = 0.5;      // Unused in autonomous hold, kept from your base API
+const int commandTimeout = 250;    // Kept from your base code
+
+// Autonomous front-distance hold settings
+const float SETPOINT_CM = 25.0;    // Target minimum distance to the wall
+const float HYSTERESIS  = 2.0;     // Small buffer to avoid chatter at exactly 25 cm
+const unsigned long SENSOR_PERIOD_MS = 100;  // How often to recheck distance
+const unsigned long PULSE_TIMEOUT_US = 25000; // 25 ms timeout for pulseIn
+
+unsigned long lastCommandTime = 0;
+bool isStopped = true;
+
+unsigned long lastSensorReadMs = 0;
+float lastDistanceCm = NAN;
+
+// Toggle this to false if you want to go back to your original serial-control behavior
+const bool AUTONOMOUS_FRONT_HOLD = true;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Robot is ready.");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(ULTRASONIC_TRIG, OUTPUT);
+  pinMode(ULTRASONIC_ECHO, INPUT);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  stopMotors();
+  delay(50);
+
+  if (AUTONOMOUS_FRONT_HOLD) {
+    Serial.println("Mode: Autonomous front-distance hold");
+    Serial.println("Behavior: Drive forward while distance > 25 cm, stop at 25 cm or less.");
+  } else {
+    Serial.println("Mode: Manual serial (w a s d). Combine keys like 'wd'.");
+  }
+}
+
+void loop() {
+  if (AUTONOMOUS_FRONT_HOLD) {
+    autonomousFrontHoldLoop();
+  } else {
+    manualSerialControlLoop(); // your original behavior
+  }
+}
+
+// ===============================================================
+//                AUTONOMOUS FRONT DISTANCE HOLD
+// ===============================================================
+void autonomousFrontHoldLoop() {
+  const unsigned long now = millis();
+
+  // Read the sensor on an interval to avoid spamming pulseIn
+  if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastSensorReadMs = now;
+    lastDistanceCm = measureDistanceCm();
+
+    if (isnan(lastDistanceCm)) {
+      // No echo or invalid reading
+      stopMotors();
+      if (!isStopped) {
+        Serial.println("No echo. Stopping for safety.");
+        isStopped = true;
+      }
+      return;
+    }
+
+    // Decision: forward if over setpoint plus a small buffer, else stop
+    if (lastDistanceCm > (SETPOINT_CM + HYSTERESIS)) {
+      moveForward(motorSpeed);
+      if (isStopped) {
+        Serial.print("Forward: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm from wall");
+        isStopped = false;
+      } else {
+        // Print periodic updates even while moving
+        Serial.print("Forward, distance ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm");
+      }
+    } else {
+      stopMotors();
+      if (!isStopped) {
+        Serial.print("Stop: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm <= 25.0 cm");
+        isStopped = true;
+      } else {
+        Serial.print("Holding at ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm");
+      }
+    }
+  }
+}
+
+// Returns distance in cm, or NAN on failure
+float measureDistanceCm() {
+  // Trigger a 10 microsecond pulse
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  // Read echo with a timeout
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, PULSE_TIMEOUT_US);
+  if (duration == 0) {
+    return NAN; // no echo
+  }
+
+  // Convert to cm. Speed of sound ~ 34300 cm/s. Distance = (duration us) * 0.0343 / 2
+  float cm = (duration * 0.0343f) / 2.0f;
+
+  // Basic sanity check
+  if (cm < 1.0f || cm > 400.0f) {
+    return NAN;
+  }
+  return cm;
+}
+
+// ===============================================================
+//                ORIGINAL MANUAL SERIAL CONTROL
+// ===============================================================
+void manualSerialControlLoop() {
+  // Check if there is a command waiting in the serial buffer
+  if (Serial.available() > 0) {
+    bool isMovingForward = false;
+    bool isMovingBackward = false;
+    bool isTurningLeft = false;
+    bool isTurningRight = false;
+
+    lastCommandTime = millis();
+    isStopped = false;
+
+    while (Serial.available() > 0) {
+      char command = Serial.read();
+      switch (command) {
+        case 'w': isMovingForward = true; break;
+        case 's': isMovingBackward = true; break;
+        case 'a': isTurningLeft = true;   break;
+        case 'd': isTurningRight = true;  break;
+      }
+    }
+
+    if (isMovingForward && isTurningLeft) {
+      turnForwardLeft(motorSpeed);
+    } else if (isMovingForward && isTurningRight) {
+      turnForwardRight(motorSpeed);
+    } else if (isMovingBackward && isTurningLeft) {
+      turnBackwardLeft(motorSpeed);
+    } else if (isMovingBackward && isTurningRight) {
+      turnBackwardRight(motorSpeed);
+    } else if (isMovingForward) {
+      moveForward(motorSpeed);
+    } else if (isMovingBackward) {
+      moveBackward(motorSpeed);
+    } else if (isTurningLeft) {
+      pivotLeft(motorSpeed);
+    } else if (isTurningRight) {
+      pivotRight(motorSpeed);
+    } else {
+      stopMotors();
+      isStopped = true;
+    }
+  }
+
+  // Safety timeout
+  if (millis() - lastCommandTime > commandTimeout && !isStopped) {
+    stopMotors();
+    isStopped = true;
+    Serial.println("Command timeout. Motors stopped.");
+  }
+}
+
+// ===============================================================
+//                    MOTOR CONTROL FUNCTIONS
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor direction
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    // Brake low
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, abs(leftSpeed));
+
+  // Right motor direction
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, abs(rightSpeed));
+}
+
+void stopMotors() {
+  setMotorSpeeds(0, 0);
+}
+
+void moveForward(int speed) {
+  setMotorSpeeds(speed, speed);
+}
+
+void moveBackward(int speed) {
+  setMotorSpeeds(-speed, -speed);
+}
+
+void pivotLeft(int speed) {
+  setMotorSpeeds(-speed, speed);
+}
+
+void pivotRight(int speed) {
+  setMotorSpeeds(speed, -speed);
+}
+
+void turnForwardLeft(int speed) {
+  setMotorSpeeds(speed * turnFactor, speed);
+}
+
+void turnForwardRight(int speed) {
+  setMotorSpeeds(speed, speed * turnFactor);
+}
+
+void turnBackwardLeft(int speed) {
+  setMotorSpeeds(-speed * turnFactor, -speed);
+}
+
+void turnBackwardRight(int speed) {
+  setMotorSpeeds(-speed, -speed * turnFactor);
+}
