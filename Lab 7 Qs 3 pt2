@@ -1,0 +1,594 @@
+
+/*
+ * Arduino sketch for a 2-wheel robot with a Servo-based Ultrasonic Sweep.
+ * CORE FEATURE: Autonomous Object Tracking (AUTONOMOUS_TRACK_MODE)
+ * - Behavior: Track the closest object using a precise Stop-Scan-Turn-Move step cycle.
+ * - Stops when the object is closer than TRACKING_SETPOINT_CM.
+ * - Only starts moving again when the object moves further than TRACKING_LOST_CM.
+ */
+
+
+#include <Servo.h>
+
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9   // ENA (PWM)
+#define leftMotorIn1    8   // IN1
+#define leftMotorIn2    7   // IN2
+
+
+#define rightMotorIn1   13  // IN3
+#define rightMotorIn2   12  // IN4
+#define rightMotorEnable 11 // ENB (PWM)
+
+
+// --- Ultrasonic Front Sensor ---
+#define ULTRASONIC_TRIG 3
+#define ULTRASONIC_ECHO 2
+
+
+// --- Servo for Sweep ---
+#define SERVO_PIN 5
+Servo sweepServo; // Servo object to control the sweeping sensor
+
+
+// --- Control & Configuration ---
+const int motorSpeed = 70;         // Base speed for motors (0-255)
+const float turnFactor = 0.5;      // Used for gentle turns (not pivots)
+const int commandTimeout = 250;    // Timeout for manual commands
+
+
+// Tracking and Hold Settings
+const float TRACKING_SETPOINT_CM = 15.0; // Desired stopping distance from the object
+const float TRACKING_LOST_CM = 40.0;     // Target must be further than this to trigger approach
+const float HYSTERESIS = 2.0;            // Small buffer
+const unsigned long SENSOR_PERIOD_MS = 100; // How often to recheck distance
+const unsigned long PULSE_TIMEOUT_US = 25000; // 25 ms timeout for pulseIn
+
+
+// Tracking step parameters
+const unsigned long MOVE_STEP_DURATION_MS = 3000; // Time robot moves after aligning (1.0 second)
+
+
+// Sweep parameters
+const int SWEEP_START_ANGLE = 20;
+const int SWEEP_END_ANGLE = 160;
+const int ANGLE_STEP = 10;
+const int CENTER_ANGLE = 90;
+
+
+unsigned long lastCommandTime = 0;
+bool isStopped = true;
+
+
+unsigned long lastSensorReadMs = 0;
+float lastDistanceCm = NAN;
+
+
+// --- State Machine Variables for Precise Tracking ---
+// Define the states for the new step-by-step cycle
+#define STATE_IDLE_HOLDING 0
+#define STATE_SCANNING 1
+#define STATE_MOVING_STEP 2
+
+
+int trackingState = STATE_IDLE_HOLDING;
+unsigned long moveStepStartTime = 0;
+
+
+// Mode toggles (Only AUTONOMOUS_TRACK_MODE is enabled for this goal)
+const bool AUTONOMOUS_SWEEP_MODE = false;
+const bool AUTONOMOUS_FRONT_HOLD = false;
+const bool AUTONOMOUS_TRACK_MODE = true; // NEW TRACKING MODE
+
+
+// ===============================================================
+// SETUP AND MAIN LOOP
+// ===============================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Robot is ready.");
+
+
+  // Motor pins setup
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+
+  // Ultrasonic pins setup
+  pinMode(ULTRASONIC_TRIG, OUTPUT);
+  pinMode(ULTRASONIC_ECHO, INPUT);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+
+  // Servo setup
+  sweepServo.attach(SERVO_PIN);
+  sweepServo.write(CENTER_ANGLE);
+  delay(500);
+
+
+  stopMotors();
+  delay(50);
+
+
+  if (AUTONOMOUS_TRACK_MODE) {
+    Serial.println("Mode: Autonomous Object Tracking (Step Cycle)");
+    Serial.print("Behavior: Track object, stop at ");
+    Serial.print(TRACKING_SETPOINT_CM);
+    Serial.println(" cm.");
+  } else if (AUTONOMOUS_SWEEP_MODE) {
+    Serial.println("Mode: Autonomous Sweep-based Navigation (Avoidance)");
+  } else if (AUTONOMOUS_FRONT_HOLD) {
+    Serial.println("Mode: Autonomous front-distance hold");
+  } else {
+    Serial.println("Mode: Manual serial (w a s d). Combine keys like 'wd'.");
+  }
+}
+
+
+void loop() {
+  if (AUTONOMOUS_TRACK_MODE) {
+    autonomousTrackObject();
+  } else if (AUTONOMOUS_SWEEP_MODE) {
+    // Original autonomousSweepNavigation - disabled
+    // autonomousSweepNavigation();
+  } else if (AUTONOMOUS_FRONT_HOLD) {
+    autonomousFrontHoldLoop();
+  } else {
+    manualSerialControlLoop();
+  }
+}
+
+
+// ===============================================================
+// OBJECT TRACKING LOGIC (REFACTORED FOR STEPPED MOVEMENT)
+// ===============================================================
+
+
+/**
+ * Main tracking loop using a State Machine for precise Move-Stop-Scan cycle.
+ */
+void autonomousTrackObject() {
+  const unsigned long now = millis();
+
+
+  // 1. Primary Check: If close enough to target, STOP and HOLD (Override state)
+  if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastSensorReadMs = now;
+    sweepServo.write(CENTER_ANGLE);
+    delay(50);
+    lastDistanceCm = measureDistanceCm();
+
+
+    if (!isnan(lastDistanceCm) && lastDistanceCm <= (TRACKING_SETPOINT_CM + HYSTERESIS)) {
+      stopMotors();
+      if (!isStopped) {
+        Serial.print("--- Target Reached! Holding position at ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm ---");
+        isStopped = true;
+      }
+      trackingState = STATE_IDLE_HOLDING;
+      return; // Stay stopped and skip state machine
+    }
+   
+    // If we are moving, we don't need to re-scan here, the state machine handles it.
+    if (trackingState != STATE_MOVING_STEP) {
+      // If we are not holding (checked above) and not moving, we need to scan.
+      trackingState = STATE_SCANNING;
+    }
+  }
+
+
+
+
+  // 2. State Machine Logic
+  switch (trackingState) {
+   
+    case STATE_IDLE_HOLDING:
+      // If the target has moved away (further than TRACKING_LOST_CM)
+      // Transition to SCANNING to re-acquire and move.
+      if (lastDistanceCm > TRACKING_LOST_CM) {
+        Serial.println("Target moved away. Re-acquiring target.");
+        trackingState = STATE_SCANNING;
+      }
+      break;
+
+
+    case STATE_SCANNING:
+      // Always stop before scanning for stability and precision
+      stopMotors();
+     
+      Serial.println("--- Starting Scan & Turn Step ---");
+      // Use curly braces to give 'bestAngle' local scope and prevent compilation error
+      {
+        int bestAngle = sweepForClosestTarget();
+
+
+        if (bestAngle != -1) {
+          // Step 1: Turn towards the closest object
+          executeTurn(bestAngle);
+         
+          // Step 2: Transition to the movement phase
+          moveStepStartTime = now;
+          trackingState = STATE_MOVING_STEP;
+          moveForward(motorSpeed);
+          Serial.print("Turned. Starting forward move step for ");
+          Serial.print(MOVE_STEP_DURATION_MS);
+          Serial.println("ms.");
+          isStopped = false;
+
+
+        } else {
+          // If no object is detected, keep pivoting slowly to search
+          Serial.println("No object detected in sweep range. Pivoting slowly to search.");
+          pivotRight(motorSpeed / 2); // Slow pivot to find object
+          // The next scan will happen after the SENSOR_PERIOD_MS delay.
+        }
+      }
+      break;
+
+
+    case STATE_MOVING_STEP:
+      // Check if the fixed move duration has passed
+      if (now - moveStepStartTime >= MOVE_STEP_DURATION_MS) {
+        // Step 3: Stop motors
+        stopMotors();
+        isStopped = true;
+        // Step 4: Go back to scanning to check distance and realign
+        trackingState = STATE_IDLE_HOLDING;
+        Serial.println("Move step complete. Stopping to re-scan.");
+      }
+      // Else: Keep moving (no action needed, motors were set in STATE_SCANNING)
+      break;
+  }
+}
+
+
+/**
+ * Scans the range to find the *closest* object detected, and returns the angle.
+ */
+int sweepForClosestTarget() {
+  float minDistance = 9999.0; // Start with a very large distance
+  int bestAngle = -1;
+
+
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += ANGLE_STEP) {
+    sweepServo.write(angle);
+    delay(100);
+
+
+    float dist = measureDistanceCm();
+
+
+    Serial.print("SWEEP: Angle ");
+    Serial.print(angle);
+    Serial.print(" degrees: ");
+    if (isnan(dist)) {
+      Serial.println("No Echo");
+    } else {
+      Serial.print(dist, 1);
+      Serial.println(" cm");
+    }
+
+
+    // New logic: Find the MINIMUM distance (the closest object)
+    // We ignore very close readings (< 5cm) as sensor noise/self-detection
+    if (!isnan(dist) && dist < minDistance && dist > 5.0) {
+      minDistance = dist;
+      bestAngle = angle;
+    }
+  }
+
+
+  sweepServo.write(CENTER_ANGLE);
+  delay(500);
+
+
+  if (bestAngle != -1) {
+    Serial.print("DECISION: Closest target found at ");
+    Serial.print(bestAngle);
+    Serial.print(" degrees with ");
+    Serial.print(minDistance, 1);
+    Serial.println(" cm distance.");
+  } else {
+    Serial.println("DECISION: No valid target detected within sweep range.");
+  }
+
+
+  return bestAngle;
+}
+
+
+/**
+ * Pivots the robot to align with the target angle.
+ */
+void executeTurn(int targetAngle) {
+  int angleDiff = targetAngle - CENTER_ANGLE;
+  // Adjust turn duration factor based on robot size/speed
+  int turnDurationMs = abs(angleDiff) * 8; // Increased factor for more precise turn
+
+
+  Serial.print("Turning by approx. ");
+  Serial.print(angleDiff);
+  Serial.print(" degrees (Duration: ");
+  Serial.print(turnDurationMs);
+  Serial.println("ms)");
+
+
+  // Turn Left: targetAngle (e.g., 160) is greater than CENTER_ANGLE (90)
+  if (angleDiff > 5) {
+    pivotLeft(motorSpeed);
+    delay(turnDurationMs);
+  }
+  // Turn Right: targetAngle (e.g., 20) is less than CENTER_ANGLE (90)
+  else if (angleDiff < -5) {
+    pivotRight(motorSpeed);
+    delay(turnDurationMs);
+  } else {
+    Serial.println("Already facing the target direction.");
+  }
+
+
+  stopMotors();
+  Serial.println("Turn complete.");
+}
+
+
+// ===============================================================
+// HELPER FUNCTIONS (UNCHANGED)
+// ===============================================================
+float measureDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, PULSE_TIMEOUT_US);
+  if (duration == 0) return NAN;
+
+
+  float cm = (duration * 0.0343f) / 2.0f;
+  if (cm < 1.0f || cm > 400.0f) return NAN;
+  return cm;
+}
+
+
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, abs(leftSpeed));
+
+
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, abs(rightSpeed));
+}
+
+
+void stopMotors() { setMotorSpeeds(0, 0); }
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void moveBackward(int speed) { setMotorSpeeds(-speed, -speed); }
+void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
+void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+void turnBackwardLeft(int speed) { setMotorSpeeds(-speed * turnFactor, -speed); }
+void turnBackwardRight(int speed) { setMotorSpeeds(-speed, -speed * turnFactor); }
+
+
+
+
+// ===============================================================
+// OLD NAVIGATION MODES (Disabled)
+// ===============================================================
+/*
+// Original autonomousSweepNavigation (Avoidance) - KEPT FOR REFERENCE, but disabled
+void autonomousSweepNavigation() {
+  const unsigned long now = millis();
+
+
+  if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastSensorReadMs = now;
+
+
+    sweepServo.write(CENTER_ANGLE);
+    delay(50);
+    lastDistanceCm = measureDistanceCm();
+
+
+    // If no obstacle or far enough, move forward
+    if (isnan(lastDistanceCm) || lastDistanceCm > (SWEEP_TRIGGER_CM + HYSTERESIS)) {
+      moveForward(motorSpeed);
+      if (isStopped) {
+        Serial.print("Moving Forward. Distance: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm");
+        isStopped = false;
+      }
+    } else {
+      // Obstacle detected, stop and sweep away
+      stopMotors();
+      if (!isStopped) {
+        Serial.println("--- Obstacle Detected! Starting Sweep ---");
+        isStopped = true;
+      }
+
+
+      int bestAngle = performSweepAndDecide(); // Finds the furthest/clearest path
+
+
+      if (bestAngle != -1) {
+        executeTurn(bestAngle);
+      } else {
+        Serial.println("ERROR: No clear path found, attempting a random turn.");
+        pivotRight(motorSpeed);
+        delay(500);
+        stopMotors();
+      }
+    }
+  }
+}
+
+
+// Original performSweepAndDecide (Avoidance) - KEPT FOR REFERENCE, but disabled
+int performSweepAndDecide() {
+  float maxDistance = 0.0;
+  int bestAngle = -1;
+
+
+  // Logic to find the path with the MAX distance
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += ANGLE_STEP) {
+    sweepServo.write(angle);
+    delay(100);
+
+
+    float dist = measureDistanceCm();
+
+
+    if (!isnan(dist) && dist > maxDistance) {
+      maxDistance = dist;
+      bestAngle = angle;
+    }
+  }
+
+
+  sweepServo.write(CENTER_ANGLE);
+  delay(500);
+
+
+  return bestAngle;
+}
+*/
+
+
+// AUTONOMOUS FRONT DISTANCE HOLD MODE (KEPT FOR COMPLETENESS, but disabled by default)
+void autonomousFrontHoldLoop() {
+  const unsigned long now = millis();
+
+
+  if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastSensorReadMs = now;
+
+
+    sweepServo.write(CENTER_ANGLE);
+    delay(50);
+
+
+    lastDistanceCm = measureDistanceCm();
+
+
+    if (isnan(lastDistanceCm)) {
+      stopMotors();
+      if (!isStopped) {
+        Serial.println("No echo. Stopping for safety.");
+        isStopped = true;
+      }
+      return;
+    }
+
+
+    const float FRONT_HOLD_SETPOINT = 25.0;
+
+
+    if (lastDistanceCm > (FRONT_HOLD_SETPOINT + HYSTERESIS)) {
+      moveForward(motorSpeed);
+      if (isStopped) {
+        Serial.print("Forward: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm from wall");
+        isStopped = false;
+      }
+    } else {
+      stopMotors();
+      if (!isStopped) {
+        Serial.print("Stop: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.print(" cm <= ");
+        Serial.print(FRONT_HOLD_SETPOINT, 1);
+        Serial.println(" cm");
+        isStopped = true;
+      }
+    }
+  }
+}
+
+
+// MANUAL SERIAL CONTROL MODE (KEPT FOR COMPLETENESS, but disabled by default)
+void manualSerialControlLoop() {
+  if (Serial.available() > 0) {
+    bool isMovingForward = false;
+    bool isMovingBackward = false;
+    bool isTurningLeft = false;
+    bool isTurningRight = false;
+
+
+    lastCommandTime = millis();
+    isStopped = false;
+
+
+    while (Serial.available() > 0) {
+      char command = Serial.read();
+      switch (command) {
+        case 'w': isMovingForward = true; break;
+        case 's': isMovingBackward = true; break;
+        case 'a': isTurningLeft = true; break;
+        case 'd': isTurningRight = true; break;
+      }
+    }
+
+
+    if (isMovingForward && isTurningLeft) {
+      turnForwardLeft(motorSpeed);
+    } else if (isMovingForward && isTurningRight) {
+      turnForwardRight(motorSpeed);
+    } else if (isMovingBackward && isTurningLeft) {
+      turnBackwardLeft(motorSpeed);
+    } else if (isMovingBackward && isTurningRight) {
+      turnBackwardRight(motorSpeed);
+    } else if (isMovingForward) {
+      moveForward(motorSpeed);
+    } else if (isMovingBackward) {
+      moveBackward(motorSpeed);
+    } else if (isTurningLeft) {
+      pivotLeft(motorSpeed);
+    } else if (isTurningRight) {
+      pivotRight(motorSpeed);
+    } else {
+      stopMotors();
+      isStopped = true;
+    }
+  }
+
+
+  if (millis() - lastCommandTime > commandTimeout && !isStopped) {
+    stopMotors();
+    isStopped = true;
+    Serial.println("Command timeout. Motors stopped.");
+  }
+}
+
+
+
