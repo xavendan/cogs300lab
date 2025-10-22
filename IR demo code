@@ -1,0 +1,49 @@
+// Dual IR Sensor Line Detection
+// Left sensor: A2
+// Right sensor: A1
+
+const int leftIRPin = A2;
+const int rightIRPin = A1;
+const int ledPin = 13;   // onboard LED
+
+// Adjust these thresholds after calibration
+int leftThreshold = 500;
+int rightThreshold = 500;
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+  Serial.println("Dual IR Sensor Line Detection Starting...");
+}
+
+void loop() {
+  int leftValue = analogRead(leftIRPin);
+  int rightValue = analogRead(rightIRPin);
+
+  Serial.print("Left: ");
+  Serial.print(leftValue);
+  Serial.print(" | Right: ");
+  Serial.println(rightValue);
+
+  bool leftOnWhite = leftValue > leftThreshold;
+  bool rightOnWhite = rightValue > rightThreshold;
+
+  if (leftOnWhite && rightOnWhite) {
+    Serial.println("Both sensors on white line!");
+    digitalWrite(ledPin, HIGH);
+  } 
+  else if (leftOnWhite && !rightOnWhite) {
+    Serial.println("Left sensor on white line.");
+    digitalWrite(ledPin, HIGH);
+  } 
+  else if (!leftOnWhite && rightOnWhite) {
+    Serial.println("Right sensor on white line.");
+    digitalWrite(ledPin, HIGH);
+  } 
+  else {
+    Serial.println("No white line detected.");
+    digitalWrite(ledPin, LOW);
+  }
+
+  delay(200);
+}
