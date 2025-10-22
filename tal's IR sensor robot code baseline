@@ -1,0 +1,131 @@
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9   // ENA (PWM)
+#define leftMotorIn1    8   // IN1
+#define leftMotorIn2    7   // IN2
+
+#define rightMotorIn1   13  // IN3
+#define rightMotorIn2   12  // IN4
+#define rightMotorEnable 11 // ENB (PWM)
+
+// --- IR Sensor Pins ---
+#define leftSensor A0
+#define rightSensor A1
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed = 40;        // Half speed for smooth motion
+const float turnFactor = 0.5;    // How sharply to turn during search
+const int searchTurnTime = 200;  // How long to turn while searching (ms)
+const int checkInterval = 80;    // Delay between sensor reads (ms)
+int threshold = 500;             // Adjust based on surface readings
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("White Line Follower with Search Starting...");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Sensors
+  pinMode(leftSensor, INPUT);
+  pinMode(rightSensor, INPUT);
+
+  stopMotors();
+  delay(500);
+}
+
+// ===============================================================
+// Main Loop
+// ===============================================================
+void loop() {
+  int leftValue = analogRead(leftSensor);
+  int rightValue = analogRead(rightSensor);
+
+  bool leftOnLine = leftValue > threshold;
+  bool rightOnLine = rightValue > threshold;
+
+  Serial.print("L=");
+  Serial.print(leftValue);
+  Serial.print("  R=");
+  Serial.println(rightValue);
+
+  // --- Main behavior ---
+  if (leftOnLine || rightOnLine) {
+    // Either sensor detects white → move forward
+    moveForward(baseSpeed);
+    delay(checkInterval);
+  } else {
+    // Both sensors off → stop and search for the line
+    stopMotors();
+    delay(100);
+
+    // Try to find line by wiggling
+    searchForLine();
+  }
+}
+
+// ===============================================================
+// Search Routine
+// ===============================================================
+void searchForLine() {
+  Serial.println("Searching for line...");
+
+  // Wiggle left
+  turnForwardLeft(baseSpeed);
+  delay(searchTurnTime);
+  stopMotors();
+  delay(100);
+
+  int leftValue = analogRead(leftSensor);
+  int rightValue = analogRead(rightSensor);
+  if (leftValue > threshold || rightValue > threshold) return; // Found line
+
+  // Wiggle right
+  turnForwardRight(baseSpeed);
+  delay(searchTurnTime);
+  stopMotors();
+  delay(100);
+}
+
+// ===============================================================
+// Motor Control Functions
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
