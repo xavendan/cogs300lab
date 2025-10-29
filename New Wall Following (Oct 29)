@@ -1,0 +1,249 @@
+/*
+ * 3-Sensor "Wiggle" Line Follower
+ *
+ * This sketch uses a 3-sensor (Left, Center, Right) algorithm.
+ * It follows the line by turning left or right.
+ * If it sees (1, 0, 1) (T-junction), it performs a "swivel search".
+ * If it sees (0, 0, 0) (lost line), it stops and spins to "search" for it.
+ *
+ * Sensor Logic Assumption:
+ * This code assumes you are following a WHITE line on a DARK surface.
+ * (LOW analog reading = on the line)
+ *
+ */
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9    // ENA (PWM)
+#define leftMotorIn1    8    // IN1
+#define leftMotorIn2    7    // IN2
+
+#define rightMotorIn1   13   // IN3
+#define rightMotorIn2   12   // IN4
+#define rightMotorEnable 11 // ENB (PWM)
+
+// --- IR Sensor Pins ---
+#define leftSensor A0
+#define rightSensor A1
+#define centerSensor A2
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed = 75;       // Slow speed for smooth motion (User request: 70-80)
+const float turnFactor = 0.5;   // How sharply to turn (0.5 = 50% speed)
+const int checkInterval = 50;   // Delay between sensor reads (ms)
+const int swivelTime = 150;     // How long to "swivel" for 15-deg turn (ms)
+int threshold = 300;            // Adjust based on surface readings (User request: 300)
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("3-Sensor 'Wiggle' Follower Starting...");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Sensors
+  pinMode(leftSensor, INPUT);
+  pinMode(rightSensor, INPUT);
+  pinMode(centerSensor, INPUT);
+
+  stopMotors();
+  delay(500);
+}
+
+// ===============================================================
+// Main Loop
+// ===============================================================
+void loop() {
+  int leftValue = analogRead(leftSensor);
+  int rightValue = analogRead(rightSensor);
+  int centerValue = analogRead(centerSensor);
+
+  // --- CRITICAL: Using < threshold for a WHITE line on a DARK surface ---
+  bool leftOnLine = leftValue < threshold;
+  bool rightOnLine = rightValue < threshold;
+  bool centerOnLine = centerValue < threshold;
+
+  // --- Optional: Uncomment for calibration/debugging ---
+  // Serial.print("L:");
+  // Serial.print(leftOnLine);
+  // Serial.print(" C:");
+  // Serial.print(centerOnLine);
+  // Serial.print(" R:");
+  // Serial.println(rightOnLine);
+
+  // --- Main 3-Sensor Algorithm ---
+  // Sensor states as (Left, Center, Right)
+
+  if (!leftOnLine && centerOnLine && !rightOnLine) {
+    // Case (0, 1, 0): Ideal state.
+    // Action: Go forward.
+    moveForward(baseSpeed);
+  }
+  else if (leftOnLine && centerOnLine && !rightOnLine) {
+    // Case (1, 1, 0): Veering slightly right.
+    // Action: Gentle turn left.
+    turnForwardLeft(baseSpeed);
+  }
+  else if (!leftOnLine && centerOnLine && rightOnLine) {
+    // Case (0, 1, 1): Veering slightly left.
+    // Action: Gentle turn right.
+    turnForwardRight(baseSpeed);
+  }
+  else if (leftOnLine && !centerOnLine && !rightOnLine) {
+    // Case (1, 0, 0): Veered hard right.
+    // Action: Sharp turn left.
+    pivotLeft(baseSpeed);
+  }
+  else if (!leftOnLine && !centerOnLine && rightOnLine) {
+    // Case (0, 0, 1): Veered hard left.
+    // Action: Sharp turn right.
+    pivotRight(baseSpeed);
+  }
+  else if (leftOnLine && centerOnLine && rightOnLine) {
+    // Case (1, 1, 1): All sensors on line (e.g., intersection).
+    // Action: Go forward.
+    moveForward(baseSpeed);
+  }
+  else if (leftOnLine && !centerOnLine && rightOnLine) {
+    // Case (1, 0, 1): T-Junction or 90-degree turn.
+    // Action: Stop and perform "swivel search".
+    Serial.println("T-Junction (1,0,1) detected. Swiveling...");
+    stopMotors();
+    delay(100);
+    swivelSearch();
+  }
+  else {
+    // Case (0, 0, 0): Lost the line completely.
+    // Action: Stop and search.
+    Serial.println("Lost line (0,0,0). Searching...");
+    stopMotors();
+    delay(100); // Pause before searching
+    searchForLine();
+  }
+
+  delay(checkInterval); // Slow down the loop
+}
+
+// ===============================================================
+// Search Routines
+// ===============================================================
+
+/**
+ * @brief Handles (1, 0, 1) case (T-junction).
+ * Wiggles left and right to find the line direction.
+ */
+void swivelSearch() {
+  // 1. Swivel left
+  Serial.println("Swiveling left...");
+  pivotLeft(baseSpeed);
+  delay(swivelTime);
+  stopMotors();
+  delay(100);
+
+  // Check if we found the line
+  if (analogRead(centerSensor) < threshold) {
+    Serial.println("Found line on left swivel.");
+    return; // Found it! Let main loop take over.
+  }
+
+  // 2. Swivel right (for 2x time to pass center)
+  Serial.println("Swiveling right...");
+  pivotRight(baseSpeed);
+  delay(swivelTime * 2); // Swivel past center
+  stopMotors();
+  delay(100);
+
+  // Check if we found the line
+  if (analogRead(centerSensor) < threshold) {
+    Serial.println("Found line on right swivel.");
+    return; // Found it!
+  }
+
+  // 3. Not found? Return to center.
+  Serial.println("Swivel complete, no line. Returning to center.");
+  pivotLeft(baseSpeed);
+  delay(swivelTime); // Go back to original position
+  stopMotors();
+  delay(100);
+}
+
+
+/**
+ * @brief Handles (0, 0, 0) case (Lost line).
+ * Spins in one direction until any sensor finds the line.
+ */
+void searchForLine() {
+  Serial.println("Spinning right to find line...");
+
+  // Spin right in place
+  pivotRight(baseSpeed);
+
+  // Keep spinning as long as ALL three sensors are off the line
+  while (analogRead(leftSensor) >= threshold &&
+         analogRead(centerSensor) >= threshold &&
+         analogRead(rightSensor) >= threshold) {
+    // This loop will continue to spin (motor command is already active)
+    delay(10); // Small delay to allow sensors to read
+  }
+
+  // As soon as one sensor finds the line, the loop breaks.
+  Serial.println("Found line!");
+  stopMotors();
+  delay(100); // Pause to stabilize before loop continues
+}
+
+// ===============================================================
+// Motor Control Functions
+// (Using your new baseline functions)
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+
+void pivotRight(int speed) {
+  // Left motor forward, right motor backward
+  setMotorSpeeds(speed, -speed);
+}
+
+void pivotLeft(int speed) {
+  // Left motor backward, right motor forward
+  setMotorSpeeds(-speed, speed);
+}
+
+
