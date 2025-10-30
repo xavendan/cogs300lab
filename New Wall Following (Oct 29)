@@ -1,16 +1,20 @@
 /*
- * 3-Sensor "Wiggle" Line Follower
+ * Arduino sketch for a 2-wheel robot with a Servo-based Ultrasonic Sweep.
+ * CORE FEATURE: Autonomous Step-based Navigation (AUTONOMOUS_SWEEP_MODE)
+ * - Behavior: Uses a state machine for a "Move -> Stop -> Scan -> Turn -> Repeat" cycle.
+ * - Moves forward for 5 seconds.
+ * - **NEW:** While moving, it checks the front sensor. If an obstacle gets closer
+ * than 20cm, it performs an emergency stop and re-scans.
+ * - If no obstacle, it stops after 5s, performs a sweep scan (20-160 deg)
+ * to find the WIDEST (furthest) open path.
+ * - Pivots the robot to face that new, clear direction.
+ * - Repeats the cycle.
  *
- * This sketch uses a 3-sensor (Left, Center, Right) algorithm.
- * It follows the line by turning left or right.
- * If it sees (1, 0, 1) (T-junction), it performs a "swivel search".
- * If it sees (0, 0, 0) (lost line), it stops and spins to "search" for it.
- *
- * Sensor Logic Assumption:
- * This code assumes you are following a WHITE line on a DARK surface.
- * (LOW analog reading = on the line)
- *
+ * NOTE: This file uses the motor logic from the line-follower and the
+ * state machine pattern from the object-tracker reference.
  */
+
+#include <Servo.h>
 
 // --- Pin Definitions for L298N Motor Driver ---
 #define leftMotorEnable 9    // ENA (PWM)
@@ -21,26 +25,58 @@
 #define rightMotorIn2   12   // IN4
 #define rightMotorEnable 11 // ENB (PWM)
 
-// --- IR Sensor Pins ---
-#define leftSensor A0
-#define rightSensor A1
-#define centerSensor A2
+// --- Ultrasonic Front Sensor ---
+#define ULTRASONIC_TRIG 3
+#define ULTRASONIC_ECHO 2
 
-// --- Motor & Behavior Settings ---
-const int baseSpeed = 75;       // Slow speed for smooth motion (User request: 70-80)
-const float turnFactor = 0.5;   // How sharply to turn (0.5 = 50% speed)
-const int checkInterval = 50;   // Delay between sensor reads (ms)
-const int swivelTime = 150;     // How long to "swivel" for 15-deg turn (ms)
-int threshold = 300;            // Adjust based on surface readings (User request: 300)
+// --- Servo for Sweep ---
+#define SERVO_PIN 5
+Servo sweepServo; // Servo object to control the sweeping sensor
+
+// --- Control & Configuration ---
+const int motorSpeed = 70;       // Base speed for motors (0-255)
+const float turnFactor = 0.5;      // Used for gentle turns (not pivots)
+const int commandTimeout = 250;    // Timeout for manual commands
+
+// --- Autonomous Step Navigation Settings ---
+const unsigned long MOVE_STEP_DURATION_MS = 5000; // Time robot moves after aligning (5 seconds)
+const unsigned long PULSE_TIMEOUT_US = 25000; // 25 ms timeout for pulseIn
+const float OBSTACLE_STOP_CM = 20.0;  // Safety stop distance during move step
+
+// Sweep parameters
+const int SWEEP_START_ANGLE = 20;
+const int SWEEP_END_ANGLE = 160;
+const int ANGLE_STEP = 10;
+const int CENTER_ANGLE = 90;
+
+unsigned long lastCommandTime = 0;
+bool isStopped = true;
+
+// --- State Machine Variables ---
+#define STATE_SCAN_AND_TURN 0
+#define STATE_MOVING_STEP 1
+
+int robotState = STATE_SCAN_AND_TURN; // Start by scanning
+unsigned long moveStepStartTime = 0;
+
+// --- Globals for Disabled Modes (to fix compilation) ---
+unsigned long lastSensorReadMs = 0;
+float lastDistanceCm = NAN;
+const float HYSTERESIS = 2.0;         // Small buffer
+const unsigned long SENSOR_PERIOD_MS = 100; // How often to recheck distance
+
+// Mode toggles
+const bool AUTONOMOUS_SWEEP_MODE = true;
+const bool AUTONOMOUS_FRONT_HOLD = false;
 
 // ===============================================================
-// Setup
+// SETUP AND MAIN LOOP
 // ===============================================================
 void setup() {
-  Serial.begin(9600);
-  Serial.println("3-Sensor 'Wiggle' Follower Starting...");
+  Serial.begin(115200);
+  Serial.println("Robot is ready.");
 
-  // Motor pins
+  // Motor pins setup
   pinMode(rightMotorEnable, OUTPUT);
   pinMode(rightMotorIn1, OUTPUT);
   pinMode(rightMotorIn2, OUTPUT);
@@ -48,160 +84,225 @@ void setup() {
   pinMode(leftMotorIn1, OUTPUT);
   pinMode(leftMotorIn2, OUTPUT);
 
-  // Sensors
-  pinMode(leftSensor, INPUT);
-  pinMode(rightSensor, INPUT);
-  pinMode(centerSensor, INPUT);
+  // Ultrasonic pins setup
+  pinMode(ULTRASONIC_TRIG, OUTPUT);
+  pinMode(ULTRASONIC_ECHO, INPUT);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
 
-  stopMotors();
+  // Servo setup
+  sweepServo.attach(SERVO_PIN);
+  sweepServo.write(CENTER_ANGLE);
   delay(500);
+
+  stopMotors();
+  delay(50);
+
+  if (AUTONOMOUS_SWEEP_MODE) {
+    Serial.println("Mode: Autonomous Step-based Navigation");
+    Serial.println("Behavior: Move 5s, Stop, Scan for furthest path, Turn, Repeat.");
+    Serial.print("Safety check enabled: Stop if obstacle < ");
+    Serial.print(OBSTACLE_STOP_CM);
+    Serial.println(" cm.");
+  } else if (AUTONOMOUS_FRONT_HOLD) {
+    Serial.println("Mode: Autonomous front-distance hold");
+  } else {
+    Serial.println("Mode: Manual serial (w a s d). Combine keys like 'wd'.");
+  }
 }
 
-// ===============================================================
-// Main Loop
-// ===============================================================
 void loop() {
-  int leftValue = analogRead(leftSensor);
-  int rightValue = analogRead(rightSensor);
-  int centerValue = analogRead(centerSensor);
-
-  // --- CRITICAL: Using < threshold for a WHITE line on a DARK surface ---
-  bool leftOnLine = leftValue < threshold;
-  bool rightOnLine = rightValue < threshold;
-  bool centerOnLine = centerValue < threshold;
-
-  // --- Optional: Uncomment for calibration/debugging ---
-  // Serial.print("L:");
-  // Serial.print(leftOnLine);
-  // Serial.print(" C:");
-  // Serial.print(centerOnLine);
-  // Serial.print(" R:");
-  // Serial.println(rightOnLine);
-
-  // --- Main 3-Sensor Algorithm ---
-  // Sensor states as (Left, Center, Right)
-
-  if (!leftOnLine && centerOnLine && !rightOnLine) {
-    // Case (0, 1, 0): Ideal state.
-    // Action: Go forward.
-    moveForward(baseSpeed);
+  if (AUTONOMOUS_SWEEP_MODE) {
+    autonomousStepNavigation(); // Run the new state machine
+  } else if (AUTONOMOUS_FRONT_HOLD) {
+    autonomousFrontHoldLoop();
+  } else {
+    manualSerialControlLoop();
   }
-  else if (leftOnLine && centerOnLine && !rightOnLine) {
-    // Case (1, 1, 0): Veering slightly right.
-    // Action: Gentle turn left.
-    turnForwardLeft(baseSpeed);
-  }
-  else if (!leftOnLine && centerOnLine && rightOnLine) {
-    // Case (0, 1, 1): Veering slightly left.
-    // Action: Gentle turn right.
-    turnForwardRight(baseSpeed);
-  }
-  else if (leftOnLine && !centerOnLine && !rightOnLine) {
-    // Case (1, 0, 0): Veered hard right.
-    // Action: Sharp turn left.
-    pivotLeft(baseSpeed);
-  }
-  else if (!leftOnLine && !centerOnLine && rightOnLine) {
-    // Case (0, 0, 1): Veered hard left.
-    // Action: Sharp turn right.
-    pivotRight(baseSpeed);
-  }
-  else if (leftOnLine && centerOnLine && rightOnLine) {
-    // Case (1, 1, 1): All sensors on line (e.g., intersection).
-    // Action: Go forward.
-    moveForward(baseSpeed);
-  }
-  else if (leftOnLine && !centerOnLine && rightOnLine) {
-    // Case (1, 0, 1): T-Junction or 90-degree turn.
-    // Action: Stop and perform "swivel search".
-    Serial.println("T-Junction (1,0,1) detected. Swiveling...");
-    stopMotors();
-    delay(100);
-    swivelSearch();
-  }
-  else {
-    // Case (0, 0, 0): Lost the line completely.
-    // Action: Stop and search.
-    Serial.println("Lost line (0,0,0). Searching...");
-    stopMotors();
-    delay(100); // Pause before searching
-    searchForLine();
-  }
-
-  delay(checkInterval); // Slow down the loop
 }
 
 // ===============================================================
-// Search Routines
+// STEP-BASED NAVIGATION (State Machine)
 // ===============================================================
 
 /**
- * @brief Handles (1, 0, 1) case (T-junction).
- * Wiggles left and right to find the line direction.
+ * @brief Main navigation loop using a State Machine for a precise Move-Stop-Scan cycle.
  */
-void swivelSearch() {
-  // 1. Swivel left
-  Serial.println("Swiveling left...");
-  pivotLeft(baseSpeed);
-  delay(swivelTime);
-  stopMotors();
-  delay(100);
+void autonomousStepNavigation() {
+  const unsigned long now = millis();
 
-  // Check if we found the line
-  if (analogRead(centerSensor) < threshold) {
-    Serial.println("Found line on left swivel.");
-    return; // Found it! Let main loop take over.
+  // --- State Machine Logic ---
+  switch (robotState) {
+
+    case STATE_SCAN_AND_TURN:
+      // Always stop motors before scanning for stability
+      stopMotors();
+      if (!isStopped) {
+        Serial.println("Move step complete. Stopping to re-scan.");
+        isStopped = true;
+        delay(100); // Short delay to ensure motors stop
+      }
+      
+      Serial.println("--- Starting Scan for Furthest Path ---");
+
+      // Use curly braces to give 'bestAngle' local scope
+      {
+        // 1. Scan for the FURTHEST path (Avoidance logic)
+        int bestAngle = performSweepAndDecide();
+
+        if (bestAngle != -1) {
+          // 2. Turn towards the clearest path
+          executeTurn(bestAngle);
+
+          // 3. Transition to the movement phase
+          moveStepStartTime = now;
+          robotState = STATE_MOVING_STEP;
+          moveForward(motorSpeed);
+          Serial.print("Turned. Starting forward move step for ");
+          Serial.print(MOVE_STEP_DURATION_MS / 1000.0, 1);
+          Serial.println("s.");
+          isStopped = false;
+
+        } else {
+          // If no object is detected, keep pivoting slowly to search
+          Serial.println("No path detected. Pivoting slowly to search.");
+          pivotRight(motorSpeed / 2); // Slow pivot to find object
+          delay(500); // Turn for a bit
+          // Stay in STATE_SCAN_AND_TURN to re-scan
+        }
+      }
+      break;
+
+    case STATE_MOVING_STEP:
+      // Check 1: Has the 5-second move timer expired?
+      if (now - moveStepStartTime >= MOVE_STEP_DURATION_MS) {
+        // Time is up. Go back to scanning.
+        robotState = STATE_SCAN_AND_TURN;
+        // Motors will be stopped at the start of the next state
+        break; // Exit switch
+      }
+
+      // Check 2: Is it time to check the front sensor for safety?
+      if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+        lastSensorReadMs = now;
+        sweepServo.write(CENTER_ANGLE);
+        delay(50); // Small delay for servo
+        float dist = measureDistanceCm();
+
+        if (!isnan(dist) && dist < OBSTACLE_STOP_CM) {
+          // --- EMERGENCY STOP ---
+          // Too close! Stop immediately and force a re-scan.
+          Serial.print("!!! EMERGENCY STOP: Obstacle at ");
+          Serial.print(dist);
+          Serial.println("cm. Forcing re-scan.");
+          robotState = STATE_SCAN_AND_TURN; // Go back to scanning
+          // Motors will be stopped at the start of the next state
+        }
+        // else: Path is still clear, continue moving.
+      }
+      // Motors are already running, so no "else" is needed.
+      break;
   }
-
-  // 2. Swivel right (for 2x time to pass center)
-  Serial.println("Swiveling right...");
-  pivotRight(baseSpeed);
-  delay(swivelTime * 2); // Swivel past center
-  stopMotors();
-  delay(100);
-
-  // Check if we found the line
-  if (analogRead(centerSensor) < threshold) {
-    Serial.println("Found line on right swivel.");
-    return; // Found it!
-  }
-
-  // 3. Not found? Return to center.
-  Serial.println("Swivel complete, no line. Returning to center.");
-  pivotLeft(baseSpeed);
-  delay(swivelTime); // Go back to original position
-  stopMotors();
-  delay(100);
 }
 
 
 /**
- * @brief Handles (0, 0, 0) case (Lost line).
- * Spins in one direction until any sensor finds the line.
+ * @brief Pivots the robot to align with the target angle.
  */
-void searchForLine() {
-  Serial.println("Spinning right to find line...");
+void executeTurn(int bestAngle) {
+  int angleDiff = bestAngle - CENTER_ANGLE;
+  // Simple turn duration formula - may need tuning
+  int turnDurationMs = abs(angleDiff) * 5;
 
-  // Spin right in place
-  pivotRight(baseSpeed);
+  Serial.print("Turning by approx. ");
+  Serial.print(abs(angleDiff));
+  Serial.print(" degrees (Duration: ");
+  Serial.print(turnDurationMs);
+  Serial.println("ms)");
 
-  // Keep spinning as long as ALL three sensors are off the line
-  while (analogRead(leftSensor) >= threshold &&
-         analogRead(centerSensor) >= threshold &&
-         analogRead(rightSensor) >= threshold) {
-    // This loop will continue to spin (motor command is already active)
-    delay(10); // Small delay to allow sensors to read
+  if (angleDiff > 5) { // Need to turn left
+    pivotLeft(motorSpeed);
+    delay(turnDurationMs);
+  } else if (angleDiff < -5) { // Need to turn right
+    pivotRight(motorSpeed);
+    delay(turnDurationMs);
+  } else {
+    Serial.println("Already facing the best direction.");
   }
 
-  // As soon as one sensor finds the line, the loop breaks.
-  Serial.println("Found line!");
   stopMotors();
-  delay(100); // Pause to stabilize before loop continues
+  Serial.println("Turn complete.");
+}
+
+/**
+ * @brief Scans the area and finds the angle with the MAXIMUM (furthest) distance.
+ * This is for AVOIDANCE.
+ * @return The angle (in degrees) of the clearest path, or -1 if no path found.
+ */
+int performSweepAndDecide() {
+  float maxDistance = 0.0;
+  int bestAngle = -1;
+
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += ANGLE_STEP) {
+    sweepServo.write(angle);
+    delay(100); // Give servo time to move and sensor to settle
+
+    float dist = measureDistanceCm();
+
+    Serial.print("SWEEP: Angle ");
+    Serial.print(angle);
+    Serial.print(" degrees: ");
+    if (isnan(dist)) {
+      Serial.println("No Echo");
+    } else {
+      Serial.print(dist, 1);
+      Serial.println(" cm");
+    }
+
+    // Find the path with the MAX distance
+    if (!isnan(dist) && dist > maxDistance) {
+      maxDistance = dist;
+      bestAngle = angle;
+    }
+  }
+
+  // Return servo to center
+  sweepServo.write(CENTER_ANGLE);
+  delay(500);
+
+  if (bestAngle != -1) {
+    Serial.print("DECISION: Best path found at ");
+    Serial.print(bestAngle);
+    Serial.print(" degrees with ");
+    Serial.print(maxDistance, 1);
+    Serial.println(" cm clearance.");
+  } else {
+    Serial.println("DECISION: No valid path detected in sweep range.");
+  }
+
+  return bestAngle;
+}
+
+// ===============================================================
+// HELPER FUNCTIONS
+// ===============================================================
+float measureDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, PULSE_TIMEOUT_US);
+  if (duration == 0) return NAN; // Timeout
+
+  float cm = (duration * 0.0343f) / 2.0f;
+  if (cm < 1.0f || cm > 400.0f) return NAN; // Out of range
+  return cm;
 }
 
 // ===============================================================
 // Motor Control Functions
-// (Using your new baseline functions)
+// (Identical to line_follower_robot.ino)
 // ===============================================================
 void setMotorSpeeds(int leftSpeed, int rightSpeed) {
   // Left motor
@@ -215,6 +316,7 @@ void setMotorSpeeds(int leftSpeed, int rightSpeed) {
     digitalWrite(leftMotorIn1, LOW);
     digitalWrite(leftMotorIn2, LOW);
   }
+  // Use constrain() for safety, just like in the line follower
   analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
 
   // Right motor
@@ -228,22 +330,117 @@ void setMotorSpeeds(int leftSpeed, int rightSpeed) {
     digitalWrite(rightMotorIn1, LOW);
     digitalWrite(rightMotorIn2, LOW);
   }
+  // Use constrain() for safety, just like in the line follower
   analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
 }
 
-void moveForward(int speed) { setMotorSpeeds(speed, speed); }
 void stopMotors() { setMotorSpeeds(0, 0); }
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void moveBackward(int speed) { setMotorSpeeds(-speed, -speed); }
+void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
+void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
 void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
 void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+void turnBackwardLeft(int speed) { setMotorSpeeds(-speed * turnFactor, -speed); }
+void turnBackwardRight(int speed) { setMotorSpeeds(-speed, -speed * turnFactor); }
 
-void pivotRight(int speed) {
-  // Left motor forward, right motor backward
-  setMotorSpeeds(speed, -speed);
+
+// =G=============================================================
+// AUTONOMOUS FRONT DISTANCE HOLD MODE (Disabled)
+// ===============================================================
+void autonomousFrontHoldLoop() {
+  const unsigned long now = millis();
+
+  if (now - lastSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastSensorReadMs = now;
+
+    sweepServo.write(CENTER_ANGLE);
+    delay(50);
+
+    lastDistanceCm = measureDistanceCm();
+
+    if (isnan(lastDistanceCm)) {
+      stopMotors();
+      if (!isStopped) {
+        Serial.println("No echo. Stopping for safety.");
+        isStopped = true;
+      }
+      return;
+    }
+
+    const float FRONT_HOLD_SETPOINT = 25.0;
+
+    if (lastDistanceCm > (FRONT_HOLD_SETPOINT + HYSTERESIS)) {
+      moveForward(motorSpeed);
+      if (isStopped) {
+        Serial.print("Forward: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm from wall");
+        isStopped = false;
+      }
+    } else {
+      stopMotors();
+      if (!isStopped) {
+        Serial.print("Stop: ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.print(" cm <= ");
+        Serial.print(FRONT_HOLD_SETPOINT, 1);
+        Serial.println(" cm");
+        isStopped = true;
+      }
+    }
+  }
 }
 
-void pivotLeft(int speed) {
-  // Left motor backward, right motor forward
-  setMotorSpeeds(-speed, speed);
-}
+// ===============================================================
+// MANUAL SERIAL CONTROL MODE (Disabled)
+// ===============================================================
+void manualSerialControlLoop() {
+  if (Serial.available() > 0) {
+    bool isMovingForward = false;
+    bool isMovingBackward = false;
+    bool isTurningLeft = false;
+    bool isTurningRight = false;
 
+    lastCommandTime = millis();
+    isStopped = false;
+
+    while (Serial.available() > 0) {
+      char command = Serial.read();
+      switch (command) {
+        case 'w': isMovingForward = true; break;
+        case 's': isMovingBackward = true; break;
+        case 'a': isTurningLeft = true; break;
+        case 'd': isTurningRight = true; break;
+      }
+    }
+
+    if (isMovingForward && isTurningLeft) {
+      turnForwardLeft(motorSpeed);
+    } else if (isMovingForward && isTurningRight) {
+      turnForwardRight(motorSpeed);
+    } else if (isMovingBackward && isTurningLeft) {
+      turnBackwardLeft(motorSpeed);
+    } else if (isMovingBackward && isTurningRight) {
+      turnBackwardRight(motorSpeed);
+    } else if (isMovingForward) {
+      moveForward(motorSpeed);
+    } else if (isMovingBackward) {
+      moveBackward(motorSpeed);
+    } else if (isTurningLeft) {
+      pivotLeft(motorSpeed);
+    } else if (isTurningRight) {
+      pivotRight(motorSpeed);
+    } else {
+      stopMotors();
+      isStopped = true;
+    }
+  }
+
+  if (millis() - lastCommandTime > commandTimeout && !isStopped) {
+    stopMotors();
+    isStopped = true;
+    Serial.println("Command timeout. Motors stopped.");
+  }
+}
 
