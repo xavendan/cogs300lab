@@ -1,0 +1,230 @@
+#include <Servo.h>
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9    // ENA (PWM)
+#define leftMotorIn1    8    // IN1
+#define leftMotorIn2    7    // IN2
+
+#define rightMotorIn1   13   // IN3
+#define rightMotorIn2   12   // IN4
+#define rightMotorEnable 11  // ENB (PWM)
+
+// --- Servo & Ultrasonic Pins ---
+#define SERVO_PIN 5
+#define ULTRASONIC_TRIG 3
+#define ULTRASONIC_ECHO 2
+
+Servo wallServo; // Servo object
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed = 70;      // A good, stable speed for navigation
+const float turnFactor = 0.6;  // Turn speed (0.6 = 60% speed for inner wheel)
+
+// --- "Wiggle" Wall Following Logic Constants (TUNE THESE!) ---
+const int SETPOINT_DISTANCE_CM = 20;  // **GOAL**: How far to stay from the wall
+const int ERROR_THRESHOLD_CM = 4;     // "Dead zone" (Setpoint +/- 4cm). Go straight.
+const int FRONT_WALL_TRIGGER_CM = 15; // How close to a front wall to stop and turn
+const int WALL_GONE_TRIGGER_CM = 50;  // How far the side wall must be to count as "gone"
+
+// --- Servo Angles (TUNE THESE!) ---
+// These depend on how your servo is mounted.
+// 90 is often center, 180 left, 0 right. Adjust as needed.
+const int SERVO_FRONT_ANGLE = 90;
+const int SERVO_LEFT_ANGLE = 160; 
+const int SERVO_MOVE_DELAY = 200;     // (ms) Wait for servo to move before measuring
+
+// How long to pivot for 90-degree turns (in milliseconds). TUNE THIS!
+const int PIVOT_90_DEGREE_TIME = 450; 
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Proportional 'Wiggle' Wall Follower Starting...");
+  Serial.print("Following left wall at ");
+  Serial.print(SETPOINT_DISTANCE_CM);
+  Serial.println(" cm");
+
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(ULTRASONIC_TRIG, OUTPUT);
+  pinMode(ULTRASONIC_ECHO, INPUT);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  // Servo setup
+  wallServo.attach(SERVO_PIN);
+  wallServo.write(SERVO_FRONT_ANGLE); // Start by looking forward
+  delay(500);
+
+  stopMotors();
+  delay(500);
+}
+
+// =================================.==============================
+// Main Loop - Wall Following State Machine
+// ===============================================================
+void loop() {
+  // === 1. EMERGENCY CHECK: FRONT WALL (Outside Corner) ===
+  // Look forward to see if we're about to hit a wall
+  float frontDist = checkDistanceAtAngle(SERVO_FRONT_ANGLE);
+  Serial.print("Front: ");
+  Serial.print(frontDist);
+  Serial.print(" cm | ");
+
+  if (frontDist < FRONT_WALL_TRIGGER_CM) {
+    // --- STATE: OUTSIDE CORNER ---
+    // Wall in front. Stop, pivot 90-deg right (away from the wall we follow).
+    Serial.println(">>> FRONT WALL! Pivoting Right.");
+    stopMotors();
+    delay(100);
+    pivotRight(baseSpeed);
+    delay(PIVOT_90_DEGREE_TIME); // Tune this delay!
+    stopMotors();
+    delay(100);
+    return; // Restart the loop
+  }
+
+  // === 2. CORNER CHECK: SIDE WALL (Following & Inside Corner) ===
+  // No front wall, so look left to check on our following wall.
+  float leftDist = checkDistanceAtAngle(SERVO_LEFT_ANGLE);
+  Serial.print("Left: ");
+  Serial.print(leftDist);
+  Serial.print(" cm");
+
+  if (leftDist > WALL_GONE_TRIGGER_CM) {
+    // --- STATE: INSIDE CORNER ---
+    // The left wall has disappeared. We must make a 90-deg left turn.
+    Serial.println(">>> LEFT WALL GONE! Pivoting Left.");
+    stopMotors();
+    delay(100);
+    // Creep forward slightly to get into the turn
+    moveForward(baseSpeed);
+    delay(200); // Small delay to move past the corner
+    // Pivot 90-deg left to find the new wall
+    pivotLeft(baseSpeed);
+    delay(PIVOT_90_DEGREE_TIME); // Tune this delay!
+    stopMotors();
+    delay(100);
+    return; // Restart the loop
+  }
+
+  // === 3. PROPORTIONAL "WIGGLE" CONTROL ===
+  // We have a front wall that's clear and a side wall to follow.
+  // This is the normal, smooth-running state.
+  
+  // Calculate the "error" - how far we are from our goal.
+  float error = leftDist - SETPOINT_DISTANCE_CM; 
+
+  if (abs(error) < ERROR_THRESHOLD_CM) {
+    // --- STATE: JUST RIGHT ---
+    // We are in the "dead zone" (+/- 4cm). Go straight.
+    Serial.println(" | Action: Straight");
+    moveForward(baseSpeed);
+  } 
+  else if (error > 0) {
+    // --- STATE: TOO FAR ---
+    // Positive error: leftDist > setpoint. We are too far. Turn TOWARDS wall.
+    Serial.println(" | Action: Turn Left (Too Far)");
+    turnForwardLeft(baseSpeed);
+  } 
+  else { // error < 0
+    // --- STATE: TOO CLOSE ---
+    // Negative error: leftDist < setpoint. We are too close. Turn AWAY from wall.
+    Serial.println(" | Action: Turn Right (Too Close)");
+    turnForwardRight(baseSpeed);
+  }
+  
+  // No delay here, the loop runs as fast as the servo/sensor check (approx 200ms)
+}
+
+// ===============================================================
+// Ultrasonic & Servo Helper Functions
+// ===============================================================
+
+/**
+ * Points the servo to a specific angle, waits, and measures distance.
+ */
+float checkDistanceAtAngle(int angle) {
+  wallServo.write(angle);
+  delay(SERVO_MOVE_DELAY); // Wait for servo to move
+  return measureDistanceCm();
+}
+
+/**
+ * Triggers the ultrasonic sensor and returns the distance in cm.
+ */
+float measureDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  // Set a timeout of 30ms (approx 500 cm)
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000); 
+
+  if (duration == 0) {
+    return 999.0; // Return a large number on timeout
+  }
+
+  // Sound speed = 343 m/s = 0.0343 cm/us.
+  // Divide by 2 for round trip.
+  float cm = (duration * 0.0343) / 2.0;
+  return cm;
+}
+
+
+// ===============================================================
+// Motor Control Functions (Copied from your code)
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+
+void pivotRight(int speed) {
+  // Left motor forward, right motor backward
+  setMotorSpeeds(speed, -speed);
+}
+
+void pivotLeft(int speed) {
+  // Left motor backward, right motor forward
+  setMotorSpeeds(-speed, speed);
+}
