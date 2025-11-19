@@ -22,15 +22,15 @@
 Servo wallServo; // Servo object
 
 // --- Motor & Behavior Settings ---
-const int baseSpeed = 70;      // A good, stable speed for navigation
+const int baseSpeed = 90;      // A good, stable speed for navigation
 const float turnFactor = 0.6;  // Turn speed (0.6 = 60% speed for inner wheel)
 
 // --- "Frog Hop" Logic Constants (TUNE THESE!) ---
-const int HOP_TRIGGER_CLOSE_CM = 15;  // **GOAL**: If closer than this, hop away.
+const int HOP_TRIGGER_CLOSE_CM = 10;  // **GOAL**: If closer than this, hop away.
 const int HOP_TRIGGER_FAR_CM = 25;    // **GOAL**: If farther than this, hop toward.
 
 // --- "Emergency Scan" Triggers (TUNE THESE!) ---
-const int FRONT_WALL_TRIGGER_CM = 20; // How close to a front wall to trigger a sweep
+const int FRONT_WALL_TRIGGER_CM = 15; // How close to a front wall to trigger a sweep
 const int WALL_GONE_TRIGGER_CM = 50;  // How far the side wall must be to count as "gone"
 
 // --- "Sweep" Logic Constants ---
