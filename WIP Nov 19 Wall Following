@@ -1,0 +1,313 @@
+#include <Servo.h>
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9    // ENA (PWM)
+#define leftMotorIn1    8    // IN1
+#define leftMotorIn2    7    // IN2
+
+#define rightMotorIn1   13   // IN3
+#define rightMotorIn2   12   // IN4
+#define rightMotorEnable 11  // ENB (PWM)
+
+// --- Servo & Ultrasonic Pins ---
+#define SERVO_PIN 5
+// Sensor 1: Mounted on the Servo (for front/sweep)
+#define FRONT_ULTRASONIC_TRIG 3
+#define FRONT_ULTRASONIC_ECHO 2
+
+// Sensor 2: Fixed, pointing Left
+#define LEFT_ULTRASONIC_TRIG 6  
+#define LEFT_ULTRASONIC_ECHO 4  
+
+Servo wallServo; // Servo object
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed = 70;      // A good, stable speed for navigation
+const float turnFactor = 0.6;  // Turn speed (0.6 = 60% speed for inner wheel)
+
+// --- "Frog Hop" Logic Constants (TUNE THESE!) ---
+const int HOP_TRIGGER_CLOSE_CM = 15;  // **GOAL**: If closer than this, hop away.
+const int HOP_TRIGGER_FAR_CM = 25;    // **GOAL**: If farther than this, hop toward.
+
+// --- "Emergency Scan" Triggers (TUNE THESE!) ---
+const int FRONT_WALL_TRIGGER_CM = 20; // How close to a front wall to trigger a sweep
+const int WALL_GONE_TRIGGER_CM = 50;  // How far the side wall must be to count as "gone"
+
+// --- "Sweep" Logic Constants ---
+const int SWEEP_START_ANGLE = 20;     // Start of sweep (e.g., 20 deg right)
+const int SWEEP_END_ANGLE = 160;      // End of sweep (e.g., 160 deg left)
+const int SWEEP_ANGLE_STEP = 20;      // How many degrees per measurement
+const int SERVO_FRONT_ANGLE = 90;     // The angle for "straight ahead"
+const int SERVO_MOVE_DELAY = 150;     // (ms) Wait for servo to move
+const int PIVOT_TIME_PER_DEGREE = 8;  // (ms) How long to pivot for each degree of turn.
+
+// State variable for the "Frog Hop"
+// 0 = SEEKING_WALL (turning left), 1 = AVOIDING_WALL (turning right)
+int currentState = 0; 
+
+// --- Function Prototypes ---
+float checkFrontDistance();
+float measureFrontDistanceCm();
+float measureLeftDistanceCm(); 
+void setMotorSpeeds(int leftSpeed, int rightSpeed);
+void moveForward(int speed);
+void stopMotors();
+void turnForwardLeft(int speed);
+void turnForwardRight(int speed);
+void pivotRight(int speed);
+void pivotLeft(int speed);
+int performSweepAndDecide();
+void executeTurn(int bestAngle);
+void recoverLostWall(); // Updated Methodical Function
+
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Hybrid Wall Follower (Incremental) Starting...");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(FRONT_ULTRASONIC_TRIG, OUTPUT);
+  pinMode(FRONT_ULTRASONIC_ECHO, INPUT);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+
+  // Left Sensor pins
+  pinMode(LEFT_ULTRASONIC_TRIG, OUTPUT);
+  pinMode(LEFT_ULTRASONIC_ECHO, INPUT);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+
+  // Servo setup
+  wallServo.attach(SERVO_PIN);
+  wallServo.write(SERVO_FRONT_ANGLE); 
+  delay(500);
+
+  // --- SMART START LOGIC ---
+  float startDist = measureLeftDistanceCm();
+  Serial.print("Startup Left Dist: ");
+  Serial.println(startDist);
+  
+  if (startDist < HOP_TRIGGER_FAR_CM) {
+     Serial.println("Wall Detected! Starting in State 1 (STRAIGHT/AVOID)");
+     currentState = 1; 
+  } else {
+     Serial.println("No Wall! Starting in State 0 (SEEKING)");
+     currentState = 0;
+  }
+
+  delay(500);
+}
+
+// =================================.==============================
+// Main Loop
+// ===============================================================
+void loop() {
+  // === 1. EMERGENCY CHECK: FRONT WALL ===
+  float frontDist = checkFrontDistance();
+  
+  if (frontDist < FRONT_WALL_TRIGGER_CM) {
+    // --- STATE: DEAD END / OUTSIDE CORNER ---
+    Serial.println(">>> FRONT BLOCKED! Sweeping...");
+    stopMotors();
+    int bestAngle = performSweepAndDecide();
+    executeTurn(bestAngle);
+    
+    currentState = 0; 
+    return; 
+  }
+
+  // === 2. "FROG HOP" LEFT WALL FOLLOWING ===
+  float leftDist = measureLeftDistanceCm(); 
+  
+  // Check for "Inside Corner" (Wall Lost)
+  if (leftDist > WALL_GONE_TRIGGER_CM) {
+    // --- STATE: LEFT WALL LOST (INCREMENTAL RECOVERY) ---
+    Serial.println(">>> WALL LOST! Executing Incremental Left Step...");
+    recoverLostWall();
+    currentState = 0; // Reset state
+    return; 
+  }
+
+  // If no emergencies, run the hopping logic.
+  switch (currentState) {
+    case 0:
+      // --- STATE 0: SEEKING_WALL (Turning Left) ---
+      turnForwardLeft(baseSpeed); 
+      if (leftDist < HOP_TRIGGER_CLOSE_CM) {
+        currentState = 1; 
+      }
+      break;
+
+    case 1:
+      // --- STATE 1: AVOIDING_WALL (Turning Right) ---
+      turnForwardRight(baseSpeed); 
+      if (leftDist > HOP_TRIGGER_FAR_CM) {
+        currentState = 0; 
+      }
+      break;
+  }
+}
+
+// ===============================================================
+// Incremental Recovery Function (Updated)
+// ===============================================================
+void recoverLostWall() {
+  // 1. STOP to stabilize
+  stopMotors();
+  delay(100);
+
+  // 2. Pivot Left SMALL amount (e.g., 30-40 degrees)
+  // This prevents spinning past the wall. 
+  // If we still don't find it, the loop will call this again, 
+  // effectively "stepping" around the corner.
+  Serial.println("   -> Stepping Left (30 deg)");
+  int pivotTime = 30 * PIVOT_TIME_PER_DEGREE; 
+  pivotLeft(baseSpeed);
+  delay(pivotTime);
+
+  // 3. STOP again
+  stopMotors();
+  delay(100);
+
+  // 4. Move Forward briefly to catch the wall if we faced it
+  Serial.println("   -> Moving Forward");
+  moveForward(baseSpeed);
+  delay(300); // Short burst forward
+
+  // 5. STOP and return to loop (which will re-check sensors)
+  stopMotors();
+  delay(100);
+}
+
+// ===============================================================
+// Ultrasonic & Servo Helper Functions
+// ===============================================================
+
+float checkFrontDistance() {
+  wallServo.write(SERVO_FRONT_ANGLE);
+  delay(SERVO_MOVE_DELAY); 
+  return measureFrontDistanceCm();
+}
+
+float measureFrontDistanceCm() {
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+
+  unsigned long duration = pulseIn(FRONT_ULTRASONIC_ECHO, HIGH, 30000); 
+  if (duration == 0) return 999.0;
+  return (duration * 0.0343) / 2.0;
+}
+
+float measureLeftDistanceCm() {
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+
+  unsigned long duration = pulseIn(LEFT_ULTRASONIC_ECHO, HIGH, 30000); 
+  if (duration == 0) return 999.0;
+  return (duration * 0.0343) / 2.0;
+}
+
+
+// ===============================================================
+// "Sweep" Functions
+// ===============================================================
+
+int performSweepAndDecide() {
+  Serial.println("--- SWEEP START ---");
+  float maxDistance = 0.0;
+  int bestAngle = -1;
+
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += SWEEP_ANGLE_STEP) {
+    wallServo.write(angle);
+    delay(SERVO_MOVE_DELAY + 50); 
+    float dist = measureFrontDistanceCm(); 
+
+    if (dist > maxDistance && dist > FRONT_WALL_TRIGGER_CM) {
+      maxDistance = dist;
+      bestAngle = angle;
+    }
+  }
+  
+  wallServo.write(SERVO_FRONT_ANGLE);
+  
+  if (bestAngle == -1) {
+    Serial.println("--- NO PATH! TURNING LEFT ---");
+    return SWEEP_END_ANGLE; 
+  } else {
+    return bestAngle;
+  }
+}
+
+void executeTurn(int bestAngle) {
+  int angleDiff = bestAngle - SERVO_FRONT_ANGLE;
+  int turnDurationMs = abs(angleDiff) * PIVOT_TIME_PER_DEGREE; 
+
+  if (angleDiff > 10) { 
+    pivotLeft(baseSpeed);
+  } else if (angleDiff < -10) { 
+    pivotRight(baseSpeed);
+  } else {
+    return;
+  }
+  
+  delay(turnDurationMs);
+  stopMotors();
+  delay(200); 
+}
+
+
+// ===============================================================
+// Motor Control Functions (REMOVED BIAS)
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Removed Left Bias Calculation - Motors receive full power requested.
+  
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+
+void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
+void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
