@@ -1,0 +1,326 @@
+#include <Servo.h>
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9    // ENA (PWM)
+#define leftMotorIn1    8    // IN1
+#define leftMotorIn2    7    // IN2
+
+#define rightMotorIn1   13   // IN3
+#define rightMotorIn2   12   // IN4
+#define rightMotorEnable 11  // ENB (PWM)
+
+// --- Servo & Ultrasonic Pins ---
+#define SERVO_PIN 5
+// Sensor 1: Mounted on the Servo (for front/sweep)
+#define FRONT_ULTRASONIC_TRIG 3
+#define FRONT_ULTRASONIC_ECHO 2
+
+// Sensor 2: NEW! Fixed, pointing Left
+#define LEFT_ULTRASONIC_TRIG 6  // New Pin!
+#define LEFT_ULTRASONIC_ECHO 4 // New Pin!
+
+Servo wallServo; // Servo object
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed = 70;      // A good, stable speed for navigation
+const float turnFactor = 0.6;  // Turn speed (0.6 = 60% speed for inner wheel)
+
+// --- "Frog Hop" Logic Constants (TUNE THESE!) ---
+const int HOP_TRIGGER_CLOSE_CM = 15;  // **GOAL**: If closer than this, "hop" away.
+const int HOP_TRIGGER_FAR_CM = 25;    // **GOAL**: If farther than this, "hop" toward.
+
+// --- "Emergency Scan" Triggers (TUNE THESE!) ---
+const int FRONT_WALL_TRIGGER_CM = 20; // How close to a front wall to trigger a sweep
+const int WALL_GONE_TRIGGER_CM = 50;  // How far the side wall must be to count as "gone"
+
+// --- "Sweep" Logic Constants (TUNE THESE!) ---
+const int SWEEP_START_ANGLE = 20;     // Start of sweep (e.g., 20 deg right)
+const int SWEEP_END_ANGLE = 160;      // End of sweep (e.g., 160 deg left)
+const int SWEEP_ANGLE_STEP = 20;      // How many degrees per measurement
+const int SERVO_FRONT_ANGLE = 90;     // The angle for "straight ahead"
+const int SERVO_MOVE_DELAY = 150;     // (ms) Wait for servo to move
+const int PIVOT_TIME_PER_DEGREE = 8;  // (ms) How long to pivot for each degree of turn. TUNE THIS!
+
+// State variable for the "Frog Hop"
+// 0 = SEEKING_WALL (hopping toward), 1 = AVOIDING_WALL (hopping away)
+int currentState = 0; 
+
+// --- Function Prototypes ---
+float checkFrontDistance();
+float measureFrontDistanceCm();
+float measureLeftDistanceCm(); // New function!
+void setMotorSpeeds(int leftSpeed, int rightSpeed);
+void moveForward(int speed);
+void stopMotors();
+void turnForwardLeft(int speed);
+void turnForwardRight(int speed);
+void pivotRight(int speed);
+void pivotLeft(int speed);
+int performSweepAndDecide();
+void executeTurn(int bestAngle);
+
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Hybrid 'Frog Hop' Wall Follower (2-Sensor) Starting...");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(FRONT_ULTRASONIC_TRIG, OUTPUT);
+  pinMode(FRONT_ULTRASONIC_ECHO, INPUT);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+
+  // New Left Sensor pins
+  pinMode(LEFT_ULTRASONIC_TRIG, OUTPUT);
+  pinMode(LEFT_ULTRASONIC_ECHO, INPUT);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+
+  // Servo setup
+  wallServo.attach(SERVO_PIN);
+  wallServo.write(SERVO_FRONT_ANGLE); // Start by looking forward
+  delay(500);
+
+  stopMotors();
+  delay(500);
+  
+  currentState = 0; // Start in the "SEEKING_WALL" state
+}
+
+// =================================.==============================
+// Main Loop - "Frog Hop" State Machine (2-Sensor Logic)
+// ===============================================================
+void loop() {
+  // === 1. EMERGENCY CHECK: FRONT WALL ===
+  // This check overrides everything.
+  // Point servo forward and read from front sensor
+  float frontDist = checkFrontDistance();
+  Serial.print("Front: ");
+  Serial.print(frontDist);
+  Serial.print(" cm | ");
+
+  if (frontDist < FRONT_WALL_TRIGGER_CM) {
+    // --- STATE: EMERGENCY SCAN (DEAD END) ---
+    Serial.println(">>> FRONT WALL! Stopping to SWEEP...");
+    stopMotors();
+    int bestAngle = performSweepAndDecide();
+    executeTurn(bestAngle);
+    currentState = 0; // Reset state after turning
+    return; // Restart the loop
+  }
+
+  // === 2. "FROG HOP" LOGIC ===
+  // No front wall, so we perform our hop logic.
+  // Read from the NEW fixed left sensor (this is now INSTANT)
+  float leftDist = measureLeftDistanceCm(); 
+  Serial.print("Left: ");
+  Serial.print(leftDist);
+  Serial.print(" cm");
+
+  // Check for "Inside Corner" emergency
+  if (leftDist > WALL_GONE_TRIGGER_CM) {
+    // --- STATE: EMERGENCY SCAN (INSIDE CORNER) ---
+    Serial.println(">>> LEFT WALL GONE! Stopping to SWEEP...");
+    stopMotors();
+    int bestAngle = performSweepAndDecide();
+    executeTurn(bestAngle);
+    currentState = 0; // Reset state after turning
+    return; // Restart the loop
+  }
+
+  // If no emergencies, run the current state.
+  switch (currentState) {
+    case 0:
+      // --- STATE 0: SEEKING_WALL (Hopping Toward) ---
+      Serial.println(" | State: SEEKING (Turning Left)");
+      turnForwardLeft(baseSpeed); // Curve toward the wall
+
+      // Check if we've gotten too close
+      if (leftDist < HOP_TRIGGER_CLOSE_CM) {
+        Serial.println(">>> HOP TRIGGER: Too close! Switching to AVOIDING.");
+        currentState = 1; // Switch to the "AVOIDING" state
+      }
+      break;
+
+    case 1:
+      // --- STATE 1: AVOIDING_WALL (Hopping Away) ---
+      Serial.println(" | State: AVOIDING (Turning Right)");
+      turnForwardRight(baseSpeed); // Curve away from the wall
+
+      // Check if we've gotten too far
+      if (leftDist > HOP_TRIGGER_FAR_CM) {
+        Serial.println(">>> HOP TRIGGER: Too far! Switching to SEEKING.");
+        currentState = 0; // Switch to the "SEEKING" state
+      }
+      break;
+  }
+  
+  // No delay here, the loop runs much faster now!
+}
+
+// ===============================================================
+// Ultrasonic & Servo Helper Functions
+// ===============================================================
+
+/**
+ * Points the servo forward, waits, and measures distance.
+ */
+float checkFrontDistance() {
+  wallServo.write(SERVO_FRONT_ANGLE);
+  delay(SERVO_MOVE_DELAY); // Wait for servo to move
+  return measureFrontDistanceCm();
+}
+
+/**
+ * Triggers the FRONT (servo) ultrasonic sensor and returns distance.
+ */
+float measureFrontDistanceCm() {
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(FRONT_ULTRASONIC_TRIG, LOW);
+
+  unsigned long duration = pulseIn(FRONT_ULTRASONIC_ECHO, HIGH, 30000); 
+  if (duration == 0) return 999.0;
+  return (duration * 0.0343) / 2.0;
+}
+
+/**
+ * NEW FUNCTION
+ * Triggers the LEFT (fixed) ultrasonic sensor and returns distance.
+ */
+float measureLeftDistanceCm() {
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(LEFT_ULTRASONIC_TRIG, LOW);
+
+  unsigned long duration = pulseIn(LEFT_ULTRASONIC_ECHO, HIGH, 30000); 
+  if (duration == 0) return 999.0;
+  return (duration * 0.0343) / 2.0;
+}
+
+
+// ===============================================================
+// "Sweep" Functions (from previous version)
+// ===============================================================
+
+/**
+ * Sweeps the servo-mounted FRONT sensor from START to END angle.
+ */
+int performSweepAndDecide() {
+  Serial.println("--- SWEEP START ---");
+  float maxDistance = 0.0;
+  int bestAngle = -1;
+
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += SWEEP_ANGLE_STEP) {
+    wallServo.write(angle);
+    delay(SERVO_MOVE_DELAY + 50); 
+    float dist = measureFrontDistanceCm(); // Uses front sensor
+
+    Serial.print("Angle: ");
+    Serial.print(angle);
+    Serial.print(" Dist: ");
+    Serial.println(dist);
+
+    if (dist > maxDistance && dist > FRONT_WALL_TRIGGER_CM) {
+      maxDistance = dist;
+      bestAngle = angle;
+    }
+  }
+  
+  wallServo.write(SERVO_FRONT_ANGLE);
+  
+  if (bestAngle == -1) {
+    Serial.println("--- SWEEP END --- No clear path! Defaulting to 180 turn.");
+    return SWEEP_START_ANGLE; 
+  } else {
+    Serial.print("--- SWEEP END --- Best path at: ");
+    Serial.print(bestAngle);
+    Serial.println(" deg");
+    return bestAngle;
+  }
+}
+
+/**
+ * Pivots the robot to face the new 'bestAngle'.
+ */
+void executeTurn(int bestAngle) {
+  int angleDiff = bestAngle - SERVO_FRONT_ANGLE;
+  int turnDurationMs = abs(angleDiff) * PIVOT_TIME_PER_DEGREE; 
+
+  Serial.print("Turning by ");
+  Serial.print(angleDiff);
+  Serial.println(" deg");
+
+  if (angleDiff > 10) { 
+    pivotLeft(baseSpeed);
+  } else if (angleDiff < -10) { 
+    pivotRight(baseSpeed);
+  } else {
+    Serial.println("Path is straight. No turn.");
+    return;
+  }
+  
+  delay(turnDurationMs);
+  stopMotors();
+  delay(200); // Pause after turning
+}
+
+
+// ===============================================================
+// Motor Control Functions (Copied from your code)
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+
+void pivotRight(int speed) {
+  // Left motor forward, right motor backward
+  setMotorSpeeds(speed, -speed);
+}
+
+void pivotLeft(int speed) {
+  // Left motor backward, right motor forward
+  setMotorSpeeds(-speed, speed);
+}
