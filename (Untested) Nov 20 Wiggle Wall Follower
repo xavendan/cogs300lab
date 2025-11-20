@@ -1,0 +1,146 @@
+#include <Servo.h>
+
+// --- Pin Definitions ---
+#define leftMotorEnable 9
+#define leftMotorIn1    8
+#define leftMotorIn2    7
+#define rightMotorIn1   13
+#define rightMotorIn2   12
+#define rightMotorEnable 11
+
+// --- Sensors ---
+#define SERVO_PIN 5
+#define FRONT_TRIG 3
+#define FRONT_ECHO 2
+#define LEFT_TRIG 6  
+#define LEFT_ECHO 4  
+
+Servo servo; 
+
+// --- "Wiggle" Settings (Same as your Line Follower) ---
+const int baseSpeed = 80;       // Speed
+const float turnFactor = 0.5;   // 0.5 = Sharp corrections (like your line follower)
+const int checkInterval = 50;   // Loop delay
+
+// --- Wall Following Goals ---
+const int WALL_DIST_MIN = 15;   // < 15cm: Too Close -> Turn Right
+const int WALL_DIST_MAX = 25;   // > 25cm: Too Far -> Turn Left
+const int FRONT_STOP_DIST = 20; // < 20cm: Front Wall -> Turn Right (Corner)
+const int WALL_LOST_DIST = 60;  // > 60cm: Lost Wall -> Pivot Left
+
+// --- Prototypes ---
+void setMotorSpeeds(int leftSpeed, int rightSpeed);
+void moveForward(int speed);
+void stopMotors();
+void turnForwardLeft(int speed);
+void turnForwardRight(int speed);
+void pivotRight(int speed);
+void pivotLeft(int speed);
+float getFrontDistance();
+float getLeftDistance();
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Wall Wiggle Follower Starting...");
+
+  // Motor Pins
+  pinMode(rightMotorEnable, OUTPUT); pinMode(rightMotorIn1, OUTPUT); pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT); pinMode(leftMotorIn1, OUTPUT); pinMode(leftMotorIn2, OUTPUT);
+
+  // Sensor Pins
+  pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT); digitalWrite(FRONT_TRIG, LOW);
+  pinMode(LEFT_TRIG, OUTPUT); pinMode(LEFT_ECHO, INPUT); digitalWrite(LEFT_TRIG, LOW);
+
+  // Servo
+  servo.attach(SERVO_PIN);
+  servo.write(90); // Look forward
+  delay(500);
+  stopMotors();
+  delay(1000);
+}
+
+void loop() {
+  // 1. Get Distances
+  float frontDist = getFrontDistance();
+  float leftDist = getLeftDistance();
+
+  // 2. Emergency: Front Wall (Outside Corner)
+  if (frontDist < FRONT_STOP_DIST) {
+    Serial.println("Front Wall -> Pivot Right");
+    stopMotors();
+    delay(100);
+    pivotRight(baseSpeed);
+    delay(600); // Time to turn 90 deg
+    stopMotors();
+    return;
+  }
+
+  // 3. Emergency: Lost Wall (Inside Corner)
+  if (leftDist > WALL_LOST_DIST) {
+    Serial.println("Lost Wall -> Pivot Left");
+    stopMotors();
+    delay(100);
+    pivotLeft(baseSpeed);
+    delay(600); // Time to turn 90 deg
+    // Drive forward a bit to catch the wall
+    moveForward(baseSpeed);
+    delay(400);
+    return;
+  }
+
+  // 4. The "Wiggle" Logic
+  if (leftDist < WALL_DIST_MIN) {
+    // Case: TOO CLOSE (Like Right Sensor on Line) -> Turn Right
+    // Serial.println("Too Close -> Wiggle Right");
+    turnForwardRight(baseSpeed);
+  }
+  else if (leftDist > WALL_DIST_MAX) {
+    // Case: TOO FAR (Like Left Sensor on Line) -> Turn Left
+    // Serial.println("Too Far -> Wiggle Left");
+    turnForwardLeft(baseSpeed);
+  }
+  else {
+    // Case: JUST RIGHT (Like Center Sensor on Line) -> Forward
+    // Serial.println("Perfect -> Forward");
+    moveForward(baseSpeed);
+  }
+
+  delay(checkInterval);
+}
+
+// --- SENSORS ---
+float getFrontDistance() {
+  digitalWrite(FRONT_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(FRONT_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(FRONT_TRIG, LOW);
+  unsigned long d = pulseIn(FRONT_ECHO, HIGH, 25000);
+  if(d==0) return 999.0; return (d*0.0343)/2.0;
+}
+float getLeftDistance() {
+  digitalWrite(LEFT_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(LEFT_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(LEFT_TRIG, LOW);
+  unsigned long d = pulseIn(LEFT_ECHO, HIGH, 25000);
+  if(d==0) return 1.0; // Assume 0 means touching wall (SAFETY)
+  return (d*0.0343)/2.0;
+}
+
+// --- MOTORS (Same as your Line Follower) ---
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left
+  if (leftSpeed > 0) { digitalWrite(leftMotorIn1, HIGH); digitalWrite(leftMotorIn2, LOW); }
+  else { digitalWrite(leftMotorIn1, LOW); digitalWrite(leftMotorIn2, HIGH); }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right
+  if (rightSpeed > 0) { digitalWrite(rightMotorIn1, LOW); digitalWrite(rightMotorIn2, HIGH); }
+  else { digitalWrite(rightMotorIn1, HIGH); digitalWrite(rightMotorIn2, LOW); }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
+void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
+void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
