@@ -17,20 +17,25 @@
 
 Servo servo; 
 
-// --- "Wiggle" Settings ---
-const int baseSpeed = 100;       // Speed
-const float turnFactor = 0.85;   // 0.5 = Sharp corrections (higher means less sharp)
+// --- "Wiggle" Settings --- ADJUST
+const int baseSpeed = 90;       // Good speed
+// **TUNING**: Higher number (closer to 1.0) = GENTLER turns. 
+// 0.5 was too dramatic. 0.85 is smoother.
+const float gentleTurnFactor = 0.95; 
+const float sharpTurnFactor = 0.6;   
+
 const int checkInterval = 50;   // Loop delay
 
-// --- Wall Following Goals ---
-const int WALL_DIST_MIN = 11;   // < 11cm: Too Close -> Turn Right
-const int WALL_DIST_MAX = 25;   // > 25cm: Too Far -> Turn Left
-const int FRONT_STOP_DIST = 20; // < 20cm: Front Wall -> Turn Right (Corner)
-const int WALL_LOST_DIST = 60;  // > 60cm: Lost Wall -> Pivot Left
+// --- Wall Following Goals --- ADJUST
+const int CRITICAL_CLOSE_CM = 4; // < 4cm: PANIC (Turn Hard Right)
+const int WALL_DIST_MIN = 18;    // 8-18cm: Too Close (Drift Right)
+const int WALL_DIST_MAX = 28;    // 28-60cm: Too Far (Drift Left)
+const int FRONT_STOP_DIST = 20;  // < 20cm: Front Wall (Corner)
+const int WALL_LOST_DIST = 60;   // > 60cm: Wall Gone (Pivot Left)
 
 // --- Stuck Detection Settings ---
-const unsigned long STUCK_TIMEOUT_MS = 3000; // 3 seconds
-const float STUCK_TOLERANCE_CM = 2.0; // Change needed to count as "movement"
+const unsigned long STUCK_TIMEOUT_MS = 3000; 
+const float STUCK_TOLERANCE_CM = 5.0; 
 
 // Variables for Stuck Logic
 unsigned long stuckTimerStart = 0;
@@ -40,10 +45,10 @@ float lastLeftDist = 0;
 // --- Prototypes ---
 void setMotorSpeeds(int leftSpeed, int rightSpeed);
 void moveForward(int speed);
-void moveBackward(int speed); // New
+void moveBackward(int speed);
 void stopMotors();
-void turnForwardLeft(int speed);
-void turnForwardRight(int speed);
+void turnForwardLeft(float factor);
+void turnForwardRight(float factor);
 void pivotRight(int speed);
 void pivotLeft(int speed);
 float getFrontDistance();
@@ -51,7 +56,7 @@ float getLeftDistance();
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Wall Wiggle Follower (Stuck Detection) Starting...");
+  Serial.println("Wall Wiggle Follower (Smoother) Starting...");
 
   // Motor Pins
   pinMode(rightMotorEnable, OUTPUT); pinMode(rightMotorIn1, OUTPUT); pinMode(rightMotorIn2, OUTPUT);
@@ -81,41 +86,27 @@ void loop() {
   float leftDist = getLeftDistance();
 
   // --- STUCK DETECTION LOGIC ---
-  // Check if the current readings are significantly different from the last "snapshot"
-  bool frontChanged = abs(frontDist - lastFrontDist) > STUCK_TOLERANCE_CM;
-  bool leftChanged = abs(leftDist - lastLeftDist) > STUCK_TOLERANCE_CM;
-
-  if (frontChanged || leftChanged) {
-    // We are moving! Reset the timer and update the snapshot.
-    stuckTimerStart = millis();
-    lastFrontDist = frontDist;
-    lastLeftDist = leftDist;
+  bool validReading = (frontDist < 500) && (leftDist > 2.0);
+  if (validReading) {
+      bool frontChanged = abs(frontDist - lastFrontDist) > STUCK_TOLERANCE_CM;
+      bool leftChanged = abs(leftDist - lastLeftDist) > STUCK_TOLERANCE_CM;
+      if (frontChanged || leftChanged) {
+        stuckTimerStart = millis();
+        lastFrontDist = frontDist;
+        lastLeftDist = leftDist;
+      }
   }
 
-  // Check if timer expired
   if (millis() - stuckTimerStart > STUCK_TIMEOUT_MS) {
-    Serial.println(">>> ROBOT STUCK! (No sensor change for 10s) <<<");
-    
-    // 1. Stop
-    stopMotors();
-    delay(200);
-    
-    // 2. Back Up (Get off the wall)
-    Serial.println("Backing Up...");
-    moveBackward(baseSpeed);
-    delay(1000); // Back up for 1 second
-    
-    // 3. Twist slightly (Change angle to avoid same trap)
-    Serial.println("Twisting...");
-    turnForwardLeft(baseSpeed); 
-    delay(200);
-    
-    // 4. Reset Timer & Snapshot so we don't trigger again immediately
+    Serial.println(">>> STALL DETECTED! <<<");
+    stopMotors(); delay(100);
+    Serial.println("   -> FULL POWER REVERSE");
+    setMotorSpeeds(-255, -255); delay(600); 
+    Serial.println("   -> Twist");
+    turnForwardLeft(sharpTurnFactor); delay(300);
     stuckTimerStart = millis();
     lastFrontDist = getFrontDistance();
     lastLeftDist = getLeftDistance();
-    
-    // Resume loop immediately
     return; 
   }
   // -----------------------------
@@ -123,10 +114,8 @@ void loop() {
   // 2. Emergency: Front Wall (Outside Corner)
   if (frontDist < FRONT_STOP_DIST) {
     Serial.println("Front Wall -> Pivot Right");
-    stopMotors();
-    delay(100);
-    pivotRight(baseSpeed);
-    delay(600); // Time to turn 90 deg
+    stopMotors(); delay(100);
+    pivotRight(baseSpeed); delay(600); 
     stopMotors();
     return;
   }
@@ -134,27 +123,28 @@ void loop() {
   // 3. Emergency: Lost Wall (Inside Corner)
   if (leftDist > WALL_LOST_DIST) {
     Serial.println("Lost Wall -> Pivot Left");
-    stopMotors();
-    delay(100);
-    pivotLeft(baseSpeed);
-    delay(600); // Time to turn 90 deg
-    // Drive forward a bit to catch the wall
-    moveForward(baseSpeed);
-    delay(400);
+    stopMotors(); delay(100);
+    pivotLeft(baseSpeed); delay(600); 
+    moveForward(baseSpeed); delay(400);
     return;
   }
 
-  // 4. The "Wiggle" Logic
-  if (leftDist < WALL_DIST_MIN) {
-    // Case: TOO CLOSE -> Turn Right
-    turnForwardRight(baseSpeed);
+  // 4. Smoother Logic (4 Stages)
+  if (leftDist < CRITICAL_CLOSE_CM) {
+    // CRITICAL: We are about to hit the wall. Turn HARD Right.
+    turnForwardRight(sharpTurnFactor);
+  }
+  else if (leftDist < WALL_DIST_MIN) {
+    // DRIFTING CLOSE: Just nudge it gently Right.
+    turnForwardRight(gentleTurnFactor);
   }
   else if (leftDist > WALL_DIST_MAX) {
-    // Case: TOO FAR -> Turn Left
-    turnForwardLeft(baseSpeed);
+    // DRIFTING FAR: Just nudge it gently Left.
+    // This prevents the "360 loop" because it's a slow arc, not a spin.
+    turnForwardLeft(gentleTurnFactor);
   }
   else {
-    // Case: JUST RIGHT -> Forward
+    // PERFECT ZONE (18cm - 28cm): Just drive straight.
     moveForward(baseSpeed);
   }
 
@@ -174,27 +164,32 @@ float getLeftDistance() {
   digitalWrite(LEFT_TRIG, HIGH); delayMicroseconds(10);
   digitalWrite(LEFT_TRIG, LOW);
   unsigned long d = pulseIn(LEFT_ECHO, HIGH, 25000);
-  if(d==0) return 1.0; // Assume 0 means touching wall (SAFETY)
+  if(d==0) return 1.0; 
   return (d*0.0343)/2.0;
 }
 
 // --- MOTORS ---
 void setMotorSpeeds(int leftSpeed, int rightSpeed) {
-  // Left
   if (leftSpeed > 0) { digitalWrite(leftMotorIn1, HIGH); digitalWrite(leftMotorIn2, LOW); }
   else { digitalWrite(leftMotorIn1, LOW); digitalWrite(leftMotorIn2, HIGH); }
   analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
 
-  // Right
   if (rightSpeed > 0) { digitalWrite(rightMotorIn1, LOW); digitalWrite(rightMotorIn2, HIGH); }
   else { digitalWrite(rightMotorIn1, HIGH); digitalWrite(rightMotorIn2, LOW); }
   analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
 }
 
 void moveForward(int speed) { setMotorSpeeds(speed, speed); }
-void moveBackward(int speed) { setMotorSpeeds(-speed, -speed); } // New function for backing up
+void moveBackward(int speed) { setMotorSpeeds(-speed, -speed); } 
 void stopMotors() { setMotorSpeeds(0, 0); }
-void turnForwardLeft(int speed) { setMotorSpeeds(speed * turnFactor, speed); }
-void turnForwardRight(int speed) { setMotorSpeeds(speed, speed * turnFactor); }
+
+// Updated turning functions to accept a "Factor" for Smooth vs Sharp
+void turnForwardLeft(float factor) { 
+  setMotorSpeeds(baseSpeed * factor, baseSpeed); 
+}
+void turnForwardRight(float factor) { 
+  setMotorSpeeds(baseSpeed, baseSpeed * factor); 
+}
+
 void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
 void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
