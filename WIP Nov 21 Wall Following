@@ -18,18 +18,18 @@
 Servo servo; 
 
 // --- "Wiggle" Settings ---
-const int baseSpeed = 90;       // Speed
-const float turnFactor = 0.5;   // 0.5 = Sharp corrections
+const int baseSpeed = 100;       // Speed
+const float turnFactor = 0.85;   // 0.5 = Sharp corrections (higher means less sharp)
 const int checkInterval = 50;   // Loop delay
 
 // --- Wall Following Goals ---
-const int WALL_DIST_MIN = 15;   // < 15cm: Too Close -> Turn Right
+const int WALL_DIST_MIN = 11;   // < 11cm: Too Close -> Turn Right
 const int WALL_DIST_MAX = 25;   // > 25cm: Too Far -> Turn Left
 const int FRONT_STOP_DIST = 20; // < 20cm: Front Wall -> Turn Right (Corner)
 const int WALL_LOST_DIST = 60;  // > 60cm: Lost Wall -> Pivot Left
 
 // --- Stuck Detection Settings ---
-const unsigned long STUCK_TIMEOUT_MS = 5000; // 10 seconds
+const unsigned long STUCK_TIMEOUT_MS = 3000; // 3 seconds
 const float STUCK_TOLERANCE_CM = 2.0; // Change needed to count as "movement"
 
 // Variables for Stuck Logic
