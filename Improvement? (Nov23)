@@ -1,0 +1,286 @@
+#include <Servo.h>
+
+// Pin Definitions
+#define leftMotorEnable 9
+#define leftMotorIn1    8
+#define leftMotorIn2    7
+#define rightMotorIn1   13
+#define rightMotorIn2   12
+#define rightMotorEnable 11
+
+// Sensors
+#define SERVO_PIN 5
+#define FRONT_TRIG 3
+#define FRONT_ECHO 2
+#define LEFT_TRIG 6  
+#define LEFT_ECHO 4  
+
+Servo servo; 
+
+// Movement Settings
+const int baseSpeed = 80;
+const int checkInterval = 60;
+
+// Wall Following Goals
+const float LEFT_TARGET_DIST = 15.0; // target distance from left wall in cm
+const float LEFT_DEADBAND = 5.0;     // range around target where we go straight
+const float KP = 0.5;                // steering gain, smaller = smoother
+
+const int FRONT_STOP_DIST = 20;
+const int WALL_LOST_DIST  = 60;
+
+// Crash and front stuck
+const int CRASH_DIST = 8;
+const int FRONT_STUCK_THRESHOLD = 10;
+const int FRONT_STUCK_COUNT_LIMIT = 18;
+
+// Generic stuck detection based on time and distance change
+const float STUCK_DIST_EPS = 6.0;         // minimum change in cm to count as movement
+const unsigned long STUCK_TIME_LIMIT = 2000; // ms without real change before escape
+
+// Prototypes
+void setMotorSpeeds(int leftSpeed, int rightSpeed);
+void moveForward(int speed);
+void stopMotors();
+void pivotRight(int speed);
+void pivotLeft(int speed);
+float getFrontDistance();
+float getLeftDistance();
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Wall follower with smoother straights and simple stuck escape");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Sensor pins
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  digitalWrite(FRONT_TRIG, LOW);
+
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+  digitalWrite(LEFT_TRIG, LOW);
+
+  // Servo
+  servo.attach(SERVO_PIN);
+  servo.write(90);
+  delay(500);
+  stopMotors();
+  delay(1000);
+}
+
+void loop() {
+  // 1. Get distances
+  float frontDist = getFrontDistance();
+  float leftDist  = getLeftDistance();
+
+  // 2. Watchdogs and stuck tracking
+  static int frontCloseCount = 0;
+  static float lastFrontDist = -1.0;
+  static float lastLeftDist  = -1.0;
+  static unsigned long lastChangeTime = 0;
+
+  if (frontDist < FRONT_STUCK_THRESHOLD) {
+    frontCloseCount++;
+  } else {
+    frontCloseCount = 0;
+  }
+
+  // Distance change based stuck tracking
+  if (lastFrontDist < 0 && lastLeftDist < 0) {
+    // First run
+    lastFrontDist = frontDist;
+    lastLeftDist  = leftDist;
+    lastChangeTime = millis();
+  } else {
+    float df = fabs(frontDist - lastFrontDist);
+    float dl = fabs(leftDist  - lastLeftDist);
+
+    if (df > STUCK_DIST_EPS || dl > STUCK_DIST_EPS) {
+      // Things changed enough, so we consider that movement
+      lastChangeTime = millis();
+    }
+
+    lastFrontDist = frontDist;
+    lastLeftDist  = leftDist;
+  }
+
+  unsigned long now = millis();
+
+  // 3. Hard crash escape
+  if (frontDist < CRASH_DIST && leftDist < CRASH_DIST) {
+    Serial.println("CRASH ESCAPE: front and left very close");
+    stopMotors();
+    delay(80);
+
+    setMotorSpeeds(-baseSpeed, -baseSpeed);
+    delay(250);
+
+    pivotRight(baseSpeed);
+    delay(450);
+
+    moveForward(baseSpeed);
+    delay(200);
+
+    stopMotors();
+    frontCloseCount = 0;
+    lastChangeTime = millis();
+    return;
+  }
+
+  // 4. Front stuck escape
+  if (frontCloseCount > FRONT_STUCK_COUNT_LIMIT) {
+    Serial.println("FRONT STUCK ESCAPE: front close for too long");
+    stopMotors();
+    delay(80);
+
+    setMotorSpeeds(-baseSpeed, -baseSpeed);
+    delay(300);
+
+    pivotRight(baseSpeed);
+    delay(450);
+
+    moveForward(baseSpeed);
+    delay(200);
+
+    stopMotors();
+    frontCloseCount = 0;
+    lastChangeTime = millis();
+    return;
+  }
+
+  // 5. Generic stuck escape if distances barely change for too long
+  if (now - lastChangeTime > STUCK_TIME_LIMIT) {
+    Serial.println("GENERIC STUCK ESCAPE: reverse and retry");
+    stopMotors();
+    delay(80);
+
+    // Just back up. Do not pivot here. Next loop will decide based on new readings.
+    setMotorSpeeds(-baseSpeed, -baseSpeed);
+    delay(400);
+
+    stopMotors();
+    lastChangeTime = millis();
+    frontCloseCount = 0;
+    return;
+  }
+
+  // 6. Emergency: front wall
+  if (frontDist < FRONT_STOP_DIST) {
+    Serial.println("Front wall: back up and gentle pivot right");
+    stopMotors();
+    delay(60);
+
+    setMotorSpeeds(-baseSpeed, -baseSpeed);
+    delay(200);
+
+    pivotRight(baseSpeed);
+    delay(350);
+
+    moveForward(baseSpeed);
+    delay(150);
+
+    stopMotors();
+    lastChangeTime = millis();
+    return;
+  }
+
+  // 7. Emergency: lost wall on left
+  if (leftDist > WALL_LOST_DIST) {
+    Serial.println("Lost wall: gentle pivot left and forward");
+    stopMotors();
+    delay(60);
+
+    pivotLeft(baseSpeed);
+    delay(350);
+
+    moveForward(baseSpeed);
+    delay(180);
+
+    stopMotors();
+    lastChangeTime = millis();
+    return;
+  }
+
+  // 8. Smooth wall following on left
+  float error = leftDist - LEFT_TARGET_DIST;
+
+  // Big deadband to keep straights calm
+  if (fabs(error) < LEFT_DEADBAND) {
+    moveForward(baseSpeed);
+  } else {
+    float steering = KP * error;  // positive means steer left, negative steer right
+
+    int leftSpeed  = baseSpeed - (int)steering;
+    int rightSpeed = baseSpeed + (int)steering;
+
+    if (leftSpeed < 0)  leftSpeed = 0;
+    if (rightSpeed < 0) rightSpeed = 0;
+    if (leftSpeed > 255)  leftSpeed = 255;
+    if (rightSpeed > 255) rightSpeed = 255;
+
+    setMotorSpeeds(leftSpeed, rightSpeed);
+  }
+
+  delay(checkInterval);
+}
+
+// Sensors
+float getFrontDistance() {
+  digitalWrite(FRONT_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(FRONT_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(FRONT_TRIG, LOW);
+
+  unsigned long d = pulseIn(FRONT_ECHO, HIGH, 25000);
+
+  if (d == 0) return 5.0;
+
+  return (d * 0.0343) / 2.0;
+}
+
+float getLeftDistance() {
+  digitalWrite(LEFT_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(LEFT_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(LEFT_TRIG, LOW);
+
+  unsigned long d = pulseIn(LEFT_ECHO, HIGH, 25000);
+  if (d == 0) return 1.0;
+  return (d * 0.0343) / 2.0;
+}
+
+// Motors
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) { setMotorSpeeds(speed, speed); }
+void stopMotors() { setMotorSpeeds(0, 0); }
+void pivotRight(int speed) { setMotorSpeeds(speed, -speed); }
+void pivotLeft(int speed) { setMotorSpeeds(-speed, speed); }
