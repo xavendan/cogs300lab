@@ -1,0 +1,368 @@
+#include <Servo.h>
+
+// -------------------- PIN DEFINITIONS --------------------
+// Motors (L298N)
+#define leftMotorEnable 9
+#define leftMotorIn1    8
+#define leftMotorIn2    7
+
+#define rightMotorIn1   13
+#define rightMotorIn2   12
+#define rightMotorEnable 11
+
+// Ultrasonics (front & left used by wall-follow; front used by object-search)
+#define FRONT_TRIG 3
+#define FRONT_ECHO 2
+
+// Left ultrasonic (wall-follow left sensor)
+#define LEFT_TRIG 6
+#define LEFT_ECHO 4
+
+// Servo for sweep / wall scanning
+#define SERVO_PIN 5
+
+// Line sensors (IR)
+#define LEFT_IR_PIN   A0
+#define RIGHT_IR_PIN  A1
+#define CENTER_IR_PIN A2
+
+// -------------------- BEHAVIOR / TUNING --------------------
+const int baseSpeed = 80;           // used by wall-follow + line follower (0-255)
+const int objectMotorSpeed = 70;    // used by object search
+const float turnFactor = 0.5;       // 50% for gentle turns
+const int checkInterval = 50;       // ms loop delay
+int lineThreshold = 300;            // IR threshold: analogRead < threshold => WHITE line
+
+// End-of-maze detection window (any sensor + any other within window)
+const unsigned long END_DETECT_WINDOW_MS = 500;
+
+// --- Wall-follow parameters ---
+const int WALL_DIST_MIN = 15;    
+const int WALL_DIST_MAX = 25;    
+const int FRONT_STOP_DIST = 20;  
+const int WALL_LOST_DIST = 60;   
+
+// --- Object tracking parameters ---
+const float TRACKING_SETPOINT_CM = 15.0; // stop distance
+const float TRACKING_LOST_CM = 40.0;
+const float HYSTERESIS = 2.0;
+const unsigned long SENSOR_PERIOD_MS = 100;
+const unsigned long PULSE_TIMEOUT_US = 25000;
+const unsigned long MOVE_STEP_DURATION_MS = 3000;
+
+// Sweep parameters
+const int SWEEP_START_ANGLE = 20;
+const int SWEEP_END_ANGLE = 160;
+const int ANGLE_STEP = 10;
+const int CENTER_ANGLE = 90;
+
+// -------------------- STATE MACHINE --------------------
+#define STATE_WALL_FOLLOW 0
+#define STATE_END_DETECT  1
+#define STATE_OBJECT_SEARCH 2
+
+int robotState = STATE_WALL_FOLLOW;
+
+// -------------------- GLOBALS --------------------
+Servo sensorServo;
+unsigned long lastSensorReadMs = 0;
+float lastDistanceCm = NAN;
+
+// Object-tracking state machine variables
+#define TSTATE_IDLE_HOLDING 0
+#define TSTATE_SCANNING 1
+#define TSTATE_MOVING_STEP 2
+int trackingState = TSTATE_IDLE_HOLDING;
+unsigned long moveStepStartTime = 0;
+bool isStopped = true;
+
+// For object tracking timing
+unsigned long lastTrackSensorReadMs = 0;
+
+// -------------------- PROTOTYPES --------------------
+void setMotorSpeeds(int leftSpeed, int rightSpeed);
+void moveForward(int speed);
+void stopMotors();
+void turnForwardLeft(int speed);
+void turnForwardRight(int speed);
+void pivotRight(int speed);
+void pivotLeft(int speed);
+
+float getFrontDistance();
+float getLeftDistance();
+
+float measureDistanceCm(); // ultrasonic used by object-search (front)
+
+void wallFollowLoop();
+void autonomousTrackObject();
+int sweepForClosestTarget();
+void executeTurn(int targetAngle);
+
+// line-detection helpers
+bool readLeftOnLine();
+bool readCenterOnLine();
+bool readRightOnLine();
+bool detectEndLineSequence_AngleTolerant();
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Integrated Robot: Wall-follow -> Angle-tolerant End-detect -> Object-search");
+
+  // Motor pins
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT); digitalWrite(FRONT_TRIG, LOW);
+  pinMode(LEFT_TRIG, OUTPUT); pinMode(LEFT_ECHO, INPUT); digitalWrite(LEFT_TRIG, LOW);
+
+  // Servo
+  sensorServo.attach(SERVO_PIN);
+  sensorServo.write(CENTER_ANGLE);
+  delay(500);
+
+  // Line sensors
+  pinMode(LEFT_IR_PIN, INPUT);
+  pinMode(RIGHT_IR_PIN, INPUT);
+  pinMode(CENTER_IR_PIN, INPUT);
+
+  stopMotors();
+  delay(200);
+
+  // Initialize object-tracking timers
+  lastTrackSensorReadMs = 0;
+  Serial.println("Ready. Starting in WALL_FOLLOW state.");
+}
+
+// -------------------- MAIN LOOP --------------------
+void loop() {
+  // Always sample IR sensors frequently to allow immediate transition
+  if (robotState == STATE_WALL_FOLLOW) {
+    // If any sensor sees white, start angle-tolerant detection
+    if (readLeftOnLine() || readCenterOnLine() || readRightOnLine()) {
+      if (detectEndLineSequence_AngleTolerant()) {
+        Serial.println("END LINE DETECTED -> Driving forward to exit maze");
+
+        // Push robot fully out of maze
+        moveForward(baseSpeed);
+        delay(2000);             // drive straight for 2 seconds
+        stopMotors();
+        delay(200);
+
+        Serial.println("Exited maze -> Switching to OBJECT_SEARCH mode");
+
+        // Now safely enter object detection mode
+        robotState = STATE_OBJECT_SEARCH;
+        trackingState = TSTATE_SCANNING;
+        isStopped = true;
+        lastTrackSensorReadMs = 0;
+
+        return;
+      }
+    }
+    // run wall-follow behavior
+    wallFollowLoop();
+  }
+  else if (robotState == STATE_OBJECT_SEARCH) {
+    // Run the object-tracking state machine
+    autonomousTrackObject();
+  }
+
+  delay(checkInterval);
+}
+
+// -------------------- LINE SENSOR FUNCTIONS --------------------
+bool readLeftOnLine() {
+  int v = analogRead(LEFT_IR_PIN);
+  return (v < lineThreshold); // true = WHITE
+}
+bool readRightOnLine() {
+  int v = analogRead(RIGHT_IR_PIN);
+  return (v < lineThreshold);
+}
+bool readCenterOnLine() {
+  int v = analogRead(CENTER_IR_PIN);
+  return (v < lineThreshold);
+}
+
+bool detectEndLineSequence_AngleTolerant() {
+  unsigned long start = millis();
+  delay(30);
+  if (!(readLeftOnLine() || readCenterOnLine() || readRightOnLine())) return false;
+
+  while (millis() - start <= END_DETECT_WINDOW_MS) {
+    bool L = readLeftOnLine();
+    bool C = readCenterOnLine();
+    bool R = readRightOnLine();
+    int count = (L ? 1 : 0) + (C ? 1 : 0) + (R ? 1 : 0);
+    if (count >= 2) return true;
+    delay(10);
+  }
+  return false;
+}
+
+// -------------------- WALL-FOLLOW --------------------
+void wallFollowLoop() {
+  float frontDist = getFrontDistance();
+  float leftDist = getLeftDistance();
+
+  if (frontDist < FRONT_STOP_DIST) {
+    Serial.println("WallFollow: Front Wall -> Pivot Right");
+    stopMotors(); delay(100);
+    pivotRight(baseSpeed); delay(600);
+    stopMotors();
+    return;
+  }
+
+  if (leftDist > WALL_LOST_DIST) {
+    Serial.println("WallFollow: Lost Wall -> Pivot Left");
+    stopMotors(); delay(100);
+    pivotLeft(baseSpeed); delay(600);
+    moveForward(baseSpeed); delay(400);
+    return;
+  }
+
+  if (leftDist < WALL_DIST_MIN) turnForwardRight(baseSpeed);
+  else if (leftDist > WALL_DIST_MAX) turnForwardLeft(baseSpeed);
+  else moveForward(baseSpeed);
+}
+
+// -------------------- ULTRASONIC HELPERS --------------------
+float getFrontDistance() {
+  digitalWrite(FRONT_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(FRONT_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(FRONT_TRIG, LOW);
+  unsigned long d = pulseIn(FRONT_ECHO, HIGH, 25000);
+  if(d==0) return 999.0;
+  return (d*0.0343)/2.0;
+}
+float getLeftDistance() {
+  digitalWrite(LEFT_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(LEFT_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(LEFT_TRIG, LOW);
+  unsigned long d = pulseIn(LEFT_ECHO, HIGH, 25000);
+  if(d==0) return 1.0;
+  return (d*0.0343)/2.0;
+}
+
+// -------------------- OBJECT-TRACKING --------------------
+void autonomousTrackObject() {
+  const unsigned long now = millis();
+
+  if (now - lastTrackSensorReadMs >= SENSOR_PERIOD_MS) {
+    lastTrackSensorReadMs = now;
+    sensorServo.write(CENTER_ANGLE);
+    delay(50);
+    lastDistanceCm = measureDistanceCm();
+
+    if (!isnan(lastDistanceCm) && lastDistanceCm <= (TRACKING_SETPOINT_CM + HYSTERESIS)) {
+      stopMotors();
+      if (!isStopped) {
+        Serial.print("--- Target Reached! Holding position at ");
+        Serial.print(lastDistanceCm, 1);
+        Serial.println(" cm ---");
+        isStopped = true;
+      }
+      trackingState = TSTATE_IDLE_HOLDING;
+      return;
+    }
+
+    if (trackingState != TSTATE_MOVING_STEP) trackingState = TSTATE_SCANNING;
+  }
+
+  switch (trackingState) {
+    case TSTATE_IDLE_HOLDING:
+      if (lastDistanceCm > TRACKING_LOST_CM) {
+        Serial.println("Target moved away. Re-acquiring target.");
+        trackingState = TSTATE_SCANNING;
+      }
+      break;
+    case TSTATE_SCANNING:
+      stopMotors();
+      Serial.println("--- Starting Scan & Turn Step ---");
+      {
+        int bestAngle = sweepForClosestTarget();
+        if (bestAngle != -1) {
+          executeTurn(bestAngle);
+          moveStepStartTime = now;
+          trackingState = TSTATE_MOVING_STEP;
+          moveForward(objectMotorSpeed);
+          Serial.print("Turned. Starting forward move step for ");
+          Serial.print(MOVE_STEP_DURATION_MS);
+          Serial.println("ms.");
+          isStopped = false;
+        } else {
+          Serial.println("No object detected in sweep range. Pivoting slowly to search.");
+          pivotRight(objectMotorSpeed / 2);
+        }
+      }
+      break;
+    case TSTATE_MOVING_STEP:
+      if (now - moveStepStartTime >= MOVE_STEP_DURATION_MS) {
+        stopMotors();
+        isStopped = true;
+        trackingState = TSTATE_IDLE_HOLDING;
+        Serial.println("Move step complete. Stopping to re-scan.");
+      }
+      break;
+  }
+}
+
+int sweepForClosestTarget() {
+  float minDistance = 9999.0;
+  int bestAngle = -1;
+  for (int angle = SWEEP_START_ANGLE; angle <= SWEEP_END_ANGLE; angle += ANGLE_STEP) {
+    sensorServo.write(angle);
+    delay(100);
+    float dist = measureDistanceCm();
+    if (!isnan(dist) && dist < minDistance && dist > 5.0) { minDistance = dist; bestAngle = angle; }
+  }
+  sensorServo.write(CENTER_ANGLE);
+  delay(500);
+  return bestAngle;
+}
+
+void executeTurn(int targetAngle) {
+  int angleDiff = targetAngle - CENTER_ANGLE;
+  int turnDurationMs = abs(angleDiff) * 8;
+  if (angleDiff > 5) { pivotLeft(objectMotorSpeed); delay(turnDurationMs); }
+  else if (angleDiff < -5) { pivotRight(objectMotorSpeed); delay(turnDurationMs); }
+  stopMotors();
+}
+
+float measureDistanceCm() {
+  digitalWrite(FRONT_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(FRONT_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(FRONT_TRIG, LOW);
+  unsigned long duration = pulseIn(FRONT_ECHO, HIGH, PULSE_TIMEOUT_US);
+  if(duration==0) return NAN;
+  float cm = (duration*0.0343f)/2.0f;
+  if(cm<1.0f||cm>400.0f) return NAN;
+  return cm;
+}
+
+// -------------------- MOTOR CONTROL --------------------
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  if(leftSpeed>0){digitalWrite(leftMotorIn1,HIGH);digitalWrite(leftMotorIn2,LOW);}
+  else if(leftSpeed<0){digitalWrite(leftMotorIn1,LOW);digitalWrite(leftMotorIn2,HIGH);}
+  else{digitalWrite(leftMotorIn1,LOW);digitalWrite(leftMotorIn2,LOW);}
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed),0,255));
+  if(rightSpeed>0){digitalWrite(rightMotorIn1,LOW);digitalWrite(rightMotorIn2,HIGH);}
+  else if(rightSpeed<0){digitalWrite(rightMotorIn1,HIGH);digitalWrite(rightMotorIn2,LOW);}
+  else{digitalWrite(rightMotorIn1,LOW);digitalWrite(rightMotorIn2,LOW);}
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed),0,255));
+}
+void moveForward(int speed){setMotorSpeeds(speed,speed);}
+void stopMotors(){setMotorSpeeds(0,0);}
+void turnForwardLeft(int speed){setMotorSpeeds(speed*turnFactor,speed);}
+void turnForwardRight(int speed){setMotorSpeeds(speed,speed*turnFactor);}
+void moveBackward(int speed){setMotorSpeeds(-speed,-speed);}
+void pivotLeft(int speed){setMotorSpeeds(-speed,speed);}
+void pivotRight(int speed){setMotorSpeeds(speed,-speed);}
+void turnBackwardLeft(int speed){setMotorSpeeds(-speed*turnFactor,-speed);}
+void turnBackwardRight(int speed){setMotorSpeeds(-speed,-speed*turnFactor);}
