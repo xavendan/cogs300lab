@@ -1,0 +1,206 @@
+/*
+ * 3-Sensor "Wiggle" Line Follower
+ *
+ * Uses Left, Center, Right IR sensors facing the floor.
+ * WHITE line on DARK surface  -> LOW analog reading = on the line.
+ *
+ * Behavior:
+ * - Follows the line by gently "wiggling" left/right.
+ * - If the line is completely lost (all sensors off), it stops
+ *   and spins slowly in place to search for it.
+ */
+
+// --- Pin Definitions for L298N Motor Driver ---
+#define leftMotorEnable 9    // ENA (PWM)
+#define leftMotorIn1    8    // IN1
+#define leftMotorIn2    7    // IN2
+
+#define rightMotorIn1   13   // IN3
+#define rightMotorIn2   12   // IN4
+#define rightMotorEnable 11  // ENB (PWM)
+
+// --- IR Sensor Pins ---
+#define leftSensor   A0
+#define rightSensor  A1
+#define centerSensor A2
+
+// --- Motor & Behavior Settings ---
+const int baseSpeed     = 110;   // Forward speed (was 80) – helps overcome stall
+const float turnFactor  = 0.5;   // Fraction of speed for inner (slow) wheel
+const int minTurnSpeed  = 75;    // Minimum PWM so motors don't stall on turns (was 55)
+const int checkInterval = 30;    // Delay between loop iterations (ms)
+
+// Threshold: LOW value = on white line. Calibrate this as needed.
+int threshold = 300;             // Adjust based on your sensor readings
+
+// ===============================================================
+// Setup
+// ===============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("3-Sensor Wiggle Line Follower Starting...");
+
+  // Motor pins
+  pinMode(leftMotorEnable,  OUTPUT);
+  pinMode(leftMotorIn1,     OUTPUT);
+  pinMode(leftMotorIn2,     OUTPUT);
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1,    OUTPUT);
+  pinMode(rightMotorIn2,    OUTPUT);
+
+  // Sensor pins
+  pinMode(leftSensor,   INPUT);
+  pinMode(centerSensor, INPUT);
+  pinMode(rightSensor,  INPUT);
+
+  stopMotors();
+  delay(500);
+}
+
+// ===============================================================
+// Main Loop
+// ===============================================================
+void loop() {
+  int leftValue   = analogRead(leftSensor);
+  int centerValue = analogRead(centerSensor);
+  int rightValue  = analogRead(rightSensor);
+
+  // WHITE line on DARK: LOW reading means "on line"
+  bool leftOnLine   = (leftValue   < threshold);
+  bool centerOnLine = (centerValue < threshold);
+  bool rightOnLine  = (rightValue  < threshold);
+
+  // Uncomment for debugging:
+  /*
+  Serial.print("L:"); Serial.print(leftValue);
+  Serial.print(" C:"); Serial.print(centerValue);
+  Serial.print(" R:"); Serial.println(rightValue);
+  */
+
+  // Sensor patterns: (Left, Center, Right)
+
+  if (!leftOnLine && centerOnLine && !rightOnLine) {
+    // (0, 1, 0): Ideal. Stay centered → go straight.
+    moveForward(baseSpeed);
+  }
+  else if (leftOnLine && centerOnLine && !rightOnLine) {
+    // (1, 1, 0): Slightly right of center → turn gently left.
+    turnForwardLeft(baseSpeed);
+  }
+  else if (!leftOnLine && centerOnLine && rightOnLine) {
+    // (0, 1, 1): Slightly left of center → turn gently right.
+    turnForwardRight(baseSpeed);
+  }
+  else if (leftOnLine && !centerOnLine && !rightOnLine) {
+    // (1, 0, 0): Far to the right of line → sharp left pivot.
+    pivotLeft(baseSpeed);
+  }
+  else if (!leftOnLine && !centerOnLine && rightOnLine) {
+    // (0, 0, 1): Far to the left of line → sharp right pivot.
+    pivotRight(baseSpeed);
+  }
+  else if (leftOnLine && centerOnLine && rightOnLine) {
+    // (1, 1, 1): All on line (thick line / intersection) → go straight.
+    moveForward(baseSpeed);
+  }
+  else if (leftOnLine && !centerOnLine && rightOnLine) {
+    // (1, 0, 1): Likely a wide/curved segment (e.g., spiral).
+    // Treat as still on line → go straight and let it settle.
+    moveForward(baseSpeed);
+  }
+  else {
+    // Probably truly lost: (0, 0, 0) or weird combo.
+    Serial.println("Lost line. Searching...");
+    stopMotors();
+    delay(100);
+    searchForLine();
+  }
+
+  delay(checkInterval);
+}
+
+// ===============================================================
+// Search Routine: spin in place until line is found
+// ===============================================================
+void searchForLine() {
+  const int searchSpeed = 90; // was 60 – stronger spin to avoid stalling
+
+  // Spin to the right in place
+  pivotRight(searchSpeed);
+
+  // Keep spinning while ALL sensors see "no line" (above threshold)
+  while (analogRead(leftSensor)   >= threshold &&
+         analogRead(centerSensor) >= threshold &&
+         analogRead(rightSensor)  >= threshold) {
+    delay(10);
+  }
+
+  // As soon as any sensor hits the line, stop and let main loop handle it.
+  stopMotors();
+  delay(100);
+}
+
+// ===============================================================
+// Motor Control Functions
+// ===============================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // --- Left motor ---
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // --- Right motor ---
+  //  rightMotorIn1 LOW,  rightMotorIn2 HIGH = forward
+  //  rightMotorIn1 HIGH, rightMotorIn2 LOW  = backward
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) {
+  setMotorSpeeds(speed, speed);
+}
+
+void stopMotors() {
+  setMotorSpeeds(0, 0);
+}
+
+// Gentle left: slow left wheel, full right wheel
+void turnForwardLeft(int speed) {
+  int slow = (int)(speed * turnFactor);
+  if (slow < minTurnSpeed) slow = minTurnSpeed;  // prevent stall
+  setMotorSpeeds(slow, speed);
+}
+
+// Gentle right: full left wheel, slow right wheel
+void turnForwardRight(int speed) {
+  int slow = (int)(speed * turnFactor);
+  if (slow < minTurnSpeed) slow = minTurnSpeed;  // prevent stall
+  setMotorSpeeds(speed, slow);
+}
+
+// Sharp right pivot in place
+void pivotRight(int speed) {
+  setMotorSpeeds(speed, -speed);
+}
+
+// Sharp left pivot in place
+void pivotLeft(int speed) {
+  setMotorSpeeds(-speed, speed);
+}
