@@ -1,0 +1,428 @@
+ #include <Servo.h>
+
+// =======================
+// Pin Definitions
+// =======================
+
+// Motors (H-bridge)
+const int leftMotorEnable = 9;
+const int leftMotorIn1    = 8;
+const int leftMotorIn2    = 7;
+
+const int rightMotorEnable = 11;
+const int rightMotorIn1    = 13;
+const int rightMotorIn2    = 12;
+
+// Ultrasonic (front, on servo)
+const int FRONT_TRIG = 3;
+const int FRONT_ECHO = 2;
+
+// Servo that rotates ultrasonic
+const int SERVO_PIN = 5;
+
+// =======================
+// Servo Angles
+// =======================
+
+const int SERVO_CENTER = 90;
+const int SERVO_LEFT   = 140;  // looking toward left side
+const int SERVO_RIGHT  = 40;   // looking toward right side
+
+// =======================
+// Motion / Distance Settings
+// =======================
+
+// Speeds (tune to taste)
+const int BASE_SPEED          = 80;   // Forward speed
+const int TURN_SPEED          = 40;   // Pivot speed for corner turns / small pivots
+const int ALIGN_TURN_SPEED    = 40;    // Slower pivot during small adjustments
+const int BACKUP_SPEED        = 80;   // Speed when reversing
+
+// Times (ms)
+const int BACKUP_TIME_MS      = 400;   // Back up duration when too close
+const int ESCAPE_TURN_TIME_MS = 350;   // For front/corner pivot
+const int CORNER_TURN_TIME_MS = 700;   // Pivot right for ~90° corner turn
+const int BACKUP_TURN_TIME_MS = 450;   // back up while turning (used on LEFT wall)
+
+// Distances (cm)
+const float FRONT_STOP_DIST   = 25.0;  // Normal "corner" distance in front
+const float VERY_CLOSE_DIST   = 8.0;   // "Basically touching" front distance
+
+// Right-wall spacing
+const float RIGHT_TARGET_DIST      = 20.0; // Desired distance from right wall (~10 cm)
+const float RIGHT_TOL              = 3.0;  // +/- tolerance around target
+const float RIGHT_TOO_CLOSE_DIST   = 6.0;  // Emergency: really hugging right wall
+
+// Left-wall spacing (emergency-only here)
+const float LEFT_TOO_CLOSE_DIST    = 6.0;  // Emergency: really hugging left wall
+
+const float MAX_WALL_DIST          = 250.0;// Beyond this: no clear side wall
+
+// Initial alignment
+const float PARALLEL_TOL           = 8.0;  // |left - right| < this => "parallel enough"
+
+// Sweep / timing
+const int SERVO_SETTLE_MS     = 300;   // Servo settle time
+const int ULTRA_TIMEOUT_US    = 25000; // pulseIn timeout
+const int LOOP_DELAY_MS       = 40;    // Main loop delay
+
+// Side check frequency
+const int RIGHT_CHECK_EVERY   = 4;     // Check right wall every N drive steps
+const int LEFT_CHECK_EVERY    = 4;     // Check left wall every N drive steps
+
+// =======================
+// State Machine
+// =======================
+
+enum RobotState {
+  STATE_ALIGN_INIT,   // One-time initial sweep + alignment
+  STATE_DRIVE         // Drive straight, handle front & side walls
+};
+
+RobotState state = STATE_ALIGN_INIT;
+
+// =======================
+// Globals
+// =======================
+
+Servo scanServo;
+
+// Debug distances
+float lastLeftDist   = 0.0;
+float lastRightDist  = 0.0;
+float lastCenterDist = 0.0;
+
+// =======================
+// Utility: Motors
+// =======================
+
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(leftMotorIn1, HIGH);
+    digitalWrite(leftMotorIn2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, HIGH);
+  } else {
+    digitalWrite(leftMotorIn1, LOW);
+    digitalWrite(leftMotorIn2, LOW);
+  }
+  analogWrite(leftMotorEnable, constrain(abs(leftSpeed), 0, 255));
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, HIGH);
+  } else if (rightSpeed < 0) {
+    digitalWrite(rightMotorIn1, HIGH);
+    digitalWrite(rightMotorIn2, LOW);
+  } else {
+    digitalWrite(rightMotorIn1, LOW);
+    digitalWrite(rightMotorIn2, LOW);
+  }
+  analogWrite(rightMotorEnable, constrain(abs(rightSpeed), 0, 255));
+}
+
+void moveForward(int speed) {
+  setMotorSpeeds(speed, speed);
+}
+
+void moveBackward(int speed) {
+  setMotorSpeeds(-speed, -speed);
+}
+
+void stopMotors() {
+  setMotorSpeeds(0, 0);
+}
+
+void pivotLeft(int speed) {
+  setMotorSpeeds(-speed, speed);
+}
+
+void pivotRight(int speed) {
+  setMotorSpeeds(speed, -speed);
+}
+
+// NEW: back up while turning away from LEFT wall (curve backwards to the RIGHT)
+// You said this "seems to work" — keeping as-is.
+void backupTurnAwayFromLeft() {
+  int slow = BACKUP_SPEED / 2;
+  int fast = BACKUP_SPEED;
+
+  // left motor = faster backward, right motor = slower backward
+  setMotorSpeeds(-fast, -slow);
+  delay(BACKUP_TURN_TIME_MS);
+  stopMotors();
+}
+
+// NEW: back up from RIGHT wall then pivot LEFT (explicit left turn)
+void backupTurnAwayFromRight() {
+  // Back up straight
+  moveBackward(BACKUP_SPEED);
+  delay(BACKUP_TIME_MS);
+  stopMotors();
+
+  // Small pivot LEFT to point away from right wall
+  pivotLeft(TURN_SPEED);
+  delay(ESCAPE_TURN_TIME_MS);   // adjust shorter/longer if needed
+  stopMotors();
+}
+
+// =======================
+// Utility: Ultrasonic
+// =======================
+
+float readUltrasonicCm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, ULTRA_TIMEOUT_US);
+  if (duration == 0) {
+    return 999.0; // no echo
+  }
+
+  return (duration * 0.0343) / 2.0;  // cm
+}
+
+// Read distance at a given servo angle (average a few samples)
+float readAtAngle(int angleDeg, int samples = 3) {
+  scanServo.write(angleDeg);
+  delay(SERVO_SETTLE_MS);
+
+  float sum = 0;
+  int valid = 0;
+  for (int i = 0; i < samples; i++) {
+    float d = readUltrasonicCm(FRONT_TRIG, FRONT_ECHO);
+    if (d > 0 && d < 500) {
+      sum += d;
+      valid++;
+    }
+    delay(10);
+  }
+  if (valid == 0) return 999.0;
+  return sum / valid;
+}
+
+// =======================
+// One-time initial ALIGN
+// =======================
+
+void alignToWallsSingle() {
+  Serial.println("ALIGN_INIT: single sweep...");
+
+  float dLeft   = readAtAngle(SERVO_LEFT);
+  float dRight  = readAtAngle(SERVO_RIGHT);
+  float dCenter = readAtAngle(SERVO_CENTER);
+
+  lastLeftDist   = dLeft;
+  lastRightDist  = dRight;
+  lastCenterDist = dCenter;
+
+  Serial.print("ALIGN_INIT | L: ");
+  Serial.print(dLeft);
+  Serial.print("  C: ");
+  Serial.print(dCenter);
+  Serial.print("  R: ");
+  Serial.println(dRight);
+
+  // If both sides are very far, just skip adjustment and start driving.
+  if (dLeft > MAX_WALL_DIST && dRight > MAX_WALL_DIST) {
+    Serial.println("ALIGN_INIT: no clear side walls, skipping adjustment.");
+    scanServo.write(SERVO_CENTER);
+    delay(SERVO_SETTLE_MS);
+    return;
+  }
+
+  float diff = dLeft - dRight;
+  if (diff < 0) diff = -diff;
+
+  if (diff <= PARALLEL_TOL) {
+    Serial.println("ALIGN_INIT: already roughly parallel.");
+  } else {
+    if (dLeft < dRight) {
+      Serial.println("ALIGN_INIT: closer to left wall -> pivot right slightly.");
+      pivotRight(ALIGN_TURN_SPEED);
+    } else {
+      Serial.println("ALIGN_INIT: closer to right wall -> pivot left slightly.");
+      pivotLeft(ALIGN_TURN_SPEED);
+    }
+    delay(250);
+    stopMotors();
+  }
+
+  scanServo.write(SERVO_CENTER);
+  delay(SERVO_SETTLE_MS);
+}
+
+// =======================
+// DRIVE STEP: front + right-wall + left-wall logic
+// =======================
+
+void driveStep() {
+  static int stepCounterRight = 0;
+  static int stepCounterLeft  = 0;
+
+  // --- Check front distance (servo forward) ---
+  scanServo.write(SERVO_CENTER);
+  float dFront = readUltrasonicCm(FRONT_TRIG, FRONT_ECHO);
+  lastCenterDist = dFront;
+
+  Serial.print("DRIVE | Front distance: ");
+  Serial.println(dFront);
+
+  // 1) Emergency: very close front wall -> backup + right escape (unchanged)
+  if (dFront < VERY_CLOSE_DIST) {
+    Serial.println("DRIVE: VERY CLOSE FRONT -> backup and right escape.");
+    stopMotors();
+    moveBackward(BACKUP_SPEED);
+    delay(BACKUP_TIME_MS);
+    stopMotors();
+
+    pivotRight(TURN_SPEED);
+    delay(ESCAPE_TURN_TIME_MS);
+    stopMotors();
+    return;
+  }
+
+  // 2) Normal corner: front within stopping distance -> right ~90° turn (unchanged)
+  if (dFront < FRONT_STOP_DIST) {
+    Serial.println("DRIVE: Corner detected -> right 90-ish turn.");
+    stopMotors();
+    delay(100);
+
+    pivotRight(TURN_SPEED);
+    delay(CORNER_TURN_TIME_MS);
+    stopMotors();
+    return;
+  }
+
+  // 3) Front is clear -> optionally adjust to side walls, then move forward
+  stepCounterRight++;
+  stepCounterLeft++;
+
+  // ---------- RIGHT WALL LOGIC ----------
+  if (stepCounterRight % RIGHT_CHECK_EVERY == 0) {
+    Serial.println("DRIVE: Right-wall check...");
+
+    stopMotors();  // don't grind while sweeping
+    float dRight = readAtAngle(SERVO_RIGHT, 2);
+    lastRightDist = dRight;
+
+    Serial.print("Right distance: ");
+    Serial.println(dRight);
+
+    bool hasRightWall = (dRight < MAX_WALL_DIST);
+
+    if (hasRightWall) {
+      // Emergency: really hugging right wall -> backup then pivot LEFT (away)
+      if (dRight < RIGHT_TOO_CLOSE_DIST) {
+        Serial.println("Too close to right wall -> backupTurnAwayFromRight().");
+        backupTurnAwayFromRight();
+      }
+      // Too close (but not emergency): pivot left slightly to move away
+      else if (dRight < (RIGHT_TARGET_DIST - RIGHT_TOL)) {
+        Serial.println("Right wall slightly too close -> small pivot left.");
+        pivotLeft(ALIGN_TURN_SPEED);
+        delay(200);
+        stopMotors();
+      }
+      // Too far from right wall: pivot right slightly to come closer
+      else if (dRight > (RIGHT_TARGET_DIST + RIGHT_TOL)) {
+        Serial.println("Right wall too far -> small pivot right.");
+        pivotRight(ALIGN_TURN_SPEED);
+        delay(200);
+        stopMotors();
+      } else {
+        Serial.println("Right wall at good distance (~10cm).");
+      }
+    } else {
+      Serial.println("No right wall detected.");
+    }
+
+    // Center servo again
+    scanServo.write(SERVO_CENTER);
+    delay(SERVO_SETTLE_MS);
+  }
+
+  // ---------- LEFT WALL LOGIC (emergency-only) ----------
+  if (stepCounterLeft % LEFT_CHECK_EVERY == 0) {
+    Serial.println("DRIVE: Left-wall check...");
+
+    stopMotors();  // don't grind while sweeping
+    float dLeft = readAtAngle(SERVO_LEFT, 2);
+    lastLeftDist = dLeft;
+
+    Serial.print("Left distance: ");
+    Serial.println(dLeft);
+
+    bool hasLeftWall = (dLeft < MAX_WALL_DIST);
+
+    if (hasLeftWall && dLeft < LEFT_TOO_CLOSE_DIST) {
+      // Emergency: really hugging left wall -> backup WHILE turning RIGHT (curve)
+      Serial.println("Too close to left wall -> backupTurnAwayFromLeft().");
+      backupTurnAwayFromLeft();
+    } else {
+      Serial.println("Left wall not too close or no left wall detected.");
+    }
+
+    // Center servo again
+    scanServo.write(SERVO_CENTER);
+    delay(SERVO_SETTLE_MS);
+  }
+
+  // Finally, move forward
+  moveForward(BASE_SPEED);
+}
+
+// =======================
+// SETUP & LOOP
+// =======================
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Maze follower (front ultrasonic with curved left-escape and pivot left-escape on right) starting...");
+
+  // Motor pins
+  pinMode(leftMotorEnable, OUTPUT);
+  pinMode(leftMotorIn1, OUTPUT);
+  pinMode(leftMotorIn2, OUTPUT);
+
+  pinMode(rightMotorEnable, OUTPUT);
+  pinMode(rightMotorIn1, OUTPUT);
+  pinMode(rightMotorIn2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  digitalWrite(FRONT_TRIG, LOW);
+
+  // Servo
+  scanServo.attach(SERVO_PIN);
+  scanServo.write(SERVO_CENTER);
+  delay(500);
+
+  stopMotors();
+  delay(500);
+}
+
+void loop() {
+  switch (state) {
+    case STATE_ALIGN_INIT: {
+      alignToWallsSingle();   // one-time sweep + alignment
+      state = STATE_DRIVE;
+      break;
+    }
+
+    case STATE_DRIVE: {
+      driveStep();            // one drive/avoid step
+      break;
+    }
+  }
+
+  delay(LOOP_DELAY_MS);
+}
